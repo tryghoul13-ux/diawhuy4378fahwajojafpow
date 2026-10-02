@@ -1705,11 +1705,16 @@ local function exportPanel()
 	local lines = { ("PANEL\t%d\t%s\t%s"):format(#list, operatorId, os.date("%H:%M:%S")) }
 	for _, entry in ipairs(list) do
 		local ex = entry.export
+		-- Рюкзак без надетых ножа/пистолета: они уже в строке оружия, иначе в exe каждый вылезал дважды
 		local items = {}
 		if entry.invItems then
-			for i = 1, math.min(3, #entry.invItems) do
-				local it = entry.invItems[i]
-				items[#items + 1] = expItem(it.id, it.rarity, it.v)
+			for _, it in ipairs(entry.invItems) do
+				if #items >= 6 then
+					break
+				end
+				if it.id ~= ex.knifeId and it.id ~= ex.gunId then
+					items[#items + 1] = expItem(it.id, it.rarity, it.v)
+				end
 			end
 		end
 		-- Поля через таб: имя, уровень, годли+(0/1), блок(0/1), нож, пистолет, итог рюкзака, топ-предметы
@@ -1731,6 +1736,46 @@ task.spawn(function()
 		task.wait(1.5)
 	end
 end)
+
+-- Анти-АФК: Roblox выкидывает после 20 минут без ввода.
+-- 1) Когда игра считает игрока простаивающим (событие Idled), жмём «виртуальную» кнопку —
+--    таймер простоя сбрасывается. От кика спасает именно это.
+-- 2) Раз в ANTI_AFK_EVERY секунд, если сам не ходил, персонаж делает шаг туда и обратно.
+local ANTI_AFK_EVERY = 30
+local ANTI_AFK_STEP = 2.5 -- длина шага, studs
+local VirtualUser = game:GetService("VirtualUser")
+table.insert(connections, Players.LocalPlayer.Idled:Connect(function()
+	pcall(function()
+		VirtualUser:CaptureController()
+		VirtualUser:ClickButton2(Vector2.new())
+	end)
+	print("[Ридер] анти-АФК: сбросил таймер простоя")
+end))
+
+task.spawn(function()
+	local lastMove = os.clock()
+	while alive do
+		task.wait(1)
+		local character = Players.LocalPlayer.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		if not (humanoid and root) or humanoid.Health <= 0 then
+			lastMove = os.clock() -- персонажа нет (респавн, между раундами) — ждём
+		elseif humanoid.MoveDirection.Magnitude > 0.1 then
+			lastMove = os.clock() -- игрок ходит сам — не мешаем
+		elseif os.clock() - lastMove >= ANTI_AFK_EVERY then
+			lastMove = os.clock()
+			local start = root.Position
+			pcall(function()
+				humanoid:MoveTo(start + root.CFrame.LookVector * ANTI_AFK_STEP)
+				task.wait(0.7)
+				humanoid:MoveTo(start)
+			end)
+			print("[Ридер] анти-АФК: шаг туда-обратно")
+		end
+	end
+end)
+print("[Ридер] анти-АФК включён: шаг раз в", ANTI_AFK_EVERY, "с")
 
 -- При повторном запуске старое окно уничтожается, отключаем и его подписки и очередь
 gui.Destroying:Connect(function()
