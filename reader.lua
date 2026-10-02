@@ -1741,7 +1741,7 @@ end)
 -- 1) Когда игра считает игрока простаивающим (событие Idled), жмём «виртуальную» кнопку —
 --    таймер простоя сбрасывается. От кика спасает именно это.
 -- 2) Раз в ANTI_AFK_EVERY секунд, если сам не ходил, персонаж делает шаг туда и обратно.
-local ANTI_AFK_EVERY = 30
+local ANTI_AFK_EVERY = 5
 local ANTI_AFK_STEP = 2.5 -- длина шага, studs
 local VirtualUser = game:GetService("VirtualUser")
 table.insert(connections, Players.LocalPlayer.Idled:Connect(function()
