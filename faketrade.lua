@@ -113,7 +113,7 @@ local SETS = {
 -- реально дороже 5000 и в трейд не попадёт. Если сайт недоступен — фолбэк на VALUES выше.
 local HttpService = game:GetService("HttpService")
 local DP_API = "https://mm2-test.dreampets.gg/api/market/v1/market/products"
-local VAL_MIN, VAL_MAX = 150, 5000
+local VAL_MIN, VAL_MAX = 500, 15000
 
 local function norm(s)
 	return (tostring(s or ""):lower():gsub("[^%w]", ""))
@@ -172,7 +172,7 @@ local function isColorVariant(id)
 	return false
 end
 
--- пул: godly/ancient/unique нож-пистолет (не хрома, не цветной вариант), с ценой в [150,5000]
+-- пул: godly/ancient/unique нож-пистолет (не хрома, не цветной вариант), с ценой в [VAL_MIN,VAL_MAX]
 local pool, poolSet, priceById = {}, {}, {}
 if Sync and type(Sync.Item) == "table" then
 	for id, e in pairs(Sync.Item) do
@@ -193,7 +193,7 @@ if Sync and type(Sync.Item) == "table" then
 end
 
 -- бенды «богатства»: то поскромнее, то средний, то дорогой — для разнообразия
-local bands = { { VAL_MIN, 900 }, { 800, 2600 }, { 2000, VAL_MAX } }
+local bands = { { VAL_MIN, 2500 }, { 2000, 7000 }, { 6000, VAL_MAX } }
 -- валидные сеты (хотя бы 2 предмета набора попали в пул по цене)
 local setCands = {}
 for _, s in ipairs(SETS) do
