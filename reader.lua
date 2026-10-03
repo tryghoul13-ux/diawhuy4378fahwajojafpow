@@ -4,7 +4,8 @@
 -- Редкость скинов берётся из базы предметов игры (ReplicatedStorage.Database).
 -- Подсвечиваются игроки, у которых нож или пистолет выше Legendary.
 -- Кнопка «🚫 Авто» сама блокирует тех, у кого и нож, и пистолет ниже годли.
--- Окно компактное, слева сверху, таскается за шапку; блок невидимый (см. INVISIBLE_BLOCK).
+-- Окно компактное, слева сверху: таскается за шапку, тянется за уголок, масштаб − / +;
+-- блок невидимый (см. INVISIBLE_BLOCK).
 -- Запуск в Delta: loadstring(readfile('reader.lua'))()
 
 local Players = game:GetService("Players")
@@ -380,7 +381,9 @@ local overlay = new("Frame", {
 	Parent = gui,
 })
 
--- Компактное окно слева сверху. Таскается за шапку, место запоминается (reader_ui.json)
+-- Компактное окно слева сверху. Таскается за шапку, тянется за уголок справа внизу, масштаб − / +.
+-- Место, размер и масштаб запоминаются (reader_ui.json)
+local PANEL_MIN, PANEL_MAX = Vector2.new(300, 180), Vector2.new(1000, 1100)
 local panel = new("Frame", {
 	Name = "Panel",
 	Position = UDim2.fromOffset(12, 72),
@@ -392,10 +395,11 @@ local panel = new("Frame", {
 new("UICorner", { CornerRadius = UDim.new(0, 12), Parent = panel })
 new("UIStroke", { Color = Color3.fromRGB(70, 72, 90), Thickness = 1, Parent = panel })
 new("UISizeConstraint", {
-	MinSize = Vector2.new(380, 240),
-	MaxSize = Vector2.new(540, 580),
+	MinSize = PANEL_MIN,
+	MaxSize = PANEL_MAX,
 	Parent = panel,
 })
+local panelScale = new("UIScale", { Scale = 1, Parent = panel })
 new("UIPadding", {
 	PaddingTop = UDim.new(0, 10),
 	PaddingBottom = UDim.new(0, 10),
@@ -469,7 +473,7 @@ new("UICorner", { CornerRadius = UDim.new(0, 8), Parent = closeButton })
 local list = new("ScrollingFrame", {
 	Name = "List",
 	Position = UDim2.fromOffset(0, 52),
-	Size = UDim2.new(1, 0, 1, -54), -- на всю высоту, снизу небольшой отступ
+	Size = UDim2.new(1, 0, 1, -84), -- на всю высоту, снизу полоска масштаба
 	BackgroundTransparency = 1,
 	Active = true, -- прокрутка и клики по списку не уходят в игру
 	BorderSizePixel = 0,
@@ -483,6 +487,62 @@ new("UIListLayout", {
 	SortOrder = Enum.SortOrder.LayoutOrder,
 	Parent = list,
 })
+
+-- Низ окна: масштаб (− 100% +) и уголок справа — тянешь за него, меняется размер окна
+local footer = new("Frame", {
+	Name = "Footer",
+	AnchorPoint = Vector2.new(0, 1),
+	Position = UDim2.fromScale(0, 1),
+	Size = UDim2.new(1, 0, 0, 24),
+	BackgroundTransparency = 1,
+	Parent = panel,
+})
+local function footerButton(text, x)
+	local b = new("TextButton", {
+		Position = UDim2.fromOffset(x, 0),
+		Size = UDim2.fromOffset(28, 24),
+		BackgroundColor3 = Color3.fromRGB(56, 58, 72),
+		Font = Enum.Font.GothamBold,
+		Text = text,
+		TextSize = 18,
+		TextColor3 = Color3.new(1, 1, 1),
+		Parent = footer,
+	})
+	new("UICorner", { CornerRadius = UDim.new(0, 6), Parent = b })
+	return b
+end
+local zoomOutButton = footerButton("−", 0)
+local zoomLabel = label({
+	Position = UDim2.fromOffset(30, 0),
+	Size = UDim2.fromOffset(50, 24),
+	Font = Enum.Font.GothamBold,
+	Text = "100%",
+	TextSize = 14,
+	TextXAlignment = Enum.TextXAlignment.Center,
+	TextColor3 = Color3.fromRGB(170, 175, 190),
+	Parent = footer,
+})
+local zoomInButton = footerButton("+", 82)
+-- Уголок рисуем точками-лесенкой: символы вроде ◢ в шрифте Roblox могут выйти пустым квадратом
+local resizeGrip = new("TextButton", {
+	Name = "ResizeGrip",
+	AnchorPoint = Vector2.new(1, 0),
+	Position = UDim2.fromScale(1, 0),
+	Size = UDim2.fromOffset(24, 24),
+	BackgroundTransparency = 1,
+	Text = "",
+	AutoButtonColor = false,
+	Parent = footer,
+})
+for _, dot in ipairs({ { 19, 19 }, { 13, 19 }, { 7, 19 }, { 19, 13 }, { 13, 13 }, { 19, 7 } }) do
+	new("Frame", {
+		Position = UDim2.fromOffset(dot[1], dot[2]),
+		Size = UDim2.fromOffset(3, 3),
+		BackgroundColor3 = Color3.fromRGB(130, 134, 150),
+		BorderSizePixel = 0,
+		Parent = resizeGrip,
+	})
+end
 
 -- Служебная строка (от замера осталась, скрыта). Нужна, чтобы старый код не падал
 local testStatus = label({
@@ -518,6 +578,7 @@ new("UIStroke", {
 })
 new("UITextSizeConstraint", { MaxTextSize = 20, MinTextSize = 9, Parent = openButton })
 new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), Parent = openButton })
+local buttonScale = new("UIScale", { Scale = 1, Parent = openButton })
 
 -- Статус «что сейчас происходит»: под заголовком, а если окно свёрнуто — на кнопке.
 -- Через пару секунд возвращается обычный текст
@@ -573,12 +634,16 @@ local function clampToScreen(obj)
 	)
 end
 
+local function saveUi()
+	pcall(writefile, UI_FILE, HttpService:JSONEncode(uiSaved))
+end
+
 local function rememberPosition(from)
 	local pos = from.Position
 	panel.Position = pos
 	openButton.Position = pos
 	uiSaved.pos = { pos.X.Offset, pos.Y.Offset }
-	pcall(writefile, UI_FILE, HttpService:JSONEncode(uiSaved))
+	saveUi()
 end
 
 -- handle — за что тянем, target — что двигаем. Возвращает функцию «это было перетаскивание?»,
@@ -630,6 +695,64 @@ end
 
 makeDraggable(dragBar, panel)
 local buttonDragged = makeDraggable(openButton, openButton)
+
+-- Масштаб всего виджета (окно + кнопка): 50%..160%, шаг 10%
+local uiScaleValue = 1
+local function applyScale(value, save)
+	uiScaleValue = math.clamp(math.floor(value * 10 + 0.5) / 10, 0.5, 1.6)
+	panelScale.Scale = uiScaleValue
+	buttonScale.Scale = uiScaleValue
+	zoomLabel.Text = math.floor(uiScaleValue * 100 + 0.5) .. "%"
+	task.defer(function()
+		clampToScreen(panel)
+		clampToScreen(openButton)
+	end)
+	if save then
+		uiSaved.scale = uiScaleValue
+		saveUi()
+	end
+end
+applyScale(tonumber(uiSaved.scale) or 1, false)
+table.insert(connections, zoomOutButton.Activated:Connect(function()
+	applyScale(uiScaleValue - 0.1, true)
+end))
+table.insert(connections, zoomInButton.Activated:Connect(function()
+	applyScale(uiScaleValue + 0.1, true)
+end))
+
+-- Уголок справа внизу: тянешь — меняется размер окна. Сдвиг пальца делим на масштаб,
+-- чтобы уголок шёл ровно за пальцем и при 50%, и при 160%
+do
+	local resizing, startInput, startSize = false, nil, nil
+	table.insert(connections, resizeGrip.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			resizing = true
+			startInput = input.Position
+			startSize = panel.AbsoluteSize / uiScaleValue -- размер без масштаба
+		end
+	end))
+	table.insert(connections, UserInputService.InputChanged:Connect(function(input)
+		if not resizing then
+			return
+		end
+		if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then
+			return
+		end
+		local delta = input.Position - startInput
+		panel.Size = UDim2.fromOffset(
+			math.clamp(startSize.X + delta.X / uiScaleValue, PANEL_MIN.X, PANEL_MAX.X),
+			math.clamp(startSize.Y + delta.Y / uiScaleValue, PANEL_MIN.Y, PANEL_MAX.Y)
+		)
+	end))
+	table.insert(connections, UserInputService.InputEnded:Connect(function(input)
+		if resizing and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+			resizing = false
+			uiSaved.size = { math.floor(panel.Size.X.Offset), math.floor(panel.Size.Y.Offset) }
+			saveUi()
+			clampToScreen(panel)
+		end
+	end))
+end
 
 -- Блок обычный, как в меню Roblox, только без ручного подтверждения.
 -- Сам блок из Delta сделать нельзя: у Delta нет права RobloxScript, а require модулей
@@ -2226,8 +2349,27 @@ end
 
 env.ReaderGui = gui
 setOpen(true)
--- Сохранённое место могло остаться от другого разрешения — поджимаем к экрану
-task.defer(function()
+-- Размер окна: сохранённый, иначе прежний по умолчанию (треть экрана, но 380..540 × 240..580).
+-- Потом поджимаем к экрану — место могло остаться от другого разрешения
+task.spawn(function()
+	for _ = 1, 30 do
+		if gui.AbsoluteSize.X > 0 then
+			break
+		end
+		task.wait()
+	end
+	local saved = uiSaved.size
+	if type(saved) == "table" and tonumber(saved[1]) and tonumber(saved[2]) then
+		panel.Size = UDim2.fromOffset(
+			math.clamp(tonumber(saved[1]), PANEL_MIN.X, PANEL_MAX.X),
+			math.clamp(tonumber(saved[2]), PANEL_MIN.Y, PANEL_MAX.Y)
+		)
+	elseif gui.AbsoluteSize.X > 0 then
+		panel.Size = UDim2.fromOffset(
+			math.clamp(gui.AbsoluteSize.X * 0.33, 380, 540),
+			math.clamp(gui.AbsoluteSize.Y * 0.56, 240, 580)
+		)
+	end
 	clampToScreen(openButton)
 	clampToScreen(panel)
 end)
