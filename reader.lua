@@ -1073,14 +1073,27 @@ local function testNote(text)
 	testStatus.Text = "🧪 " .. text
 end
 
--- Друзей не блокируем ни в замере, ни авто-блоком: блок удаляет из друзей
+-- Друзей не блокируем ни в замере, ни авто-блоком: блок удаляет из друзей.
+-- Сначала живой статус дружбы в клиенте (сразу видно, если друга удалили прямо в игре).
+-- Нет его — спрашиваем Roblox и помним ответ минуту. Ошибку запроса НЕ запоминаем: раньше один
+-- сбой навсегда записывал игрока в «друзья», и авто-блок его больше никогда не трогал
 local friendCache = {}
+local FRIEND_TTL = 60
 local function isFriend(player)
-	if friendCache[player.UserId] == nil then
-		local ok, result = pcall(Players.LocalPlayer.IsFriendsWith, Players.LocalPlayer, player.UserId)
-		friendCache[player.UserId] = not ok or result -- не смогли проверить: не трогаем
+	local okStatus, status = pcall(Players.LocalPlayer.GetFriendStatus, Players.LocalPlayer, player)
+	if okStatus and (status == Enum.FriendStatus.Friend or status == Enum.FriendStatus.NotFriend) then
+		return status == Enum.FriendStatus.Friend
 	end
-	return friendCache[player.UserId]
+	local cached = friendCache[player.UserId]
+	if cached == nil or os.clock() - cached.at > FRIEND_TTL then
+		local ok, result = pcall(Players.LocalPlayer.IsFriendsWith, Players.LocalPlayer, player.UserId)
+		if not ok then
+			return true -- не смогли проверить — сейчас не трогаем, спросим на следующем тике
+		end
+		cached = { value = result == true, at = os.clock() }
+		friendCache[player.UserId] = cached
+	end
+	return cached.value
 end
 
 -- Кого блокировать в замере: любого, кроме себя, друзей, уже заблокированных
@@ -1299,12 +1312,13 @@ local function addRow(player)
 	local stroke = new("UIStroke", { Thickness = 2, Enabled = false, Parent = row })
 
 	local name = "@" .. player.Name -- только юзернейм, дисплейное не нужно
-	label({
+	local nameLabel = label({
 		Size = UDim2.new(1, -200, 0, 22),
 		Font = Enum.Font.GothamBold,
 		Text = name,
 		TextSize = 18,
 		TextColor3 = Color3.new(1, 1, 1),
+		RichText = true, -- пометка «друг» другим цветом
 		Parent = row,
 	})
 	local level = label({
@@ -1337,6 +1351,14 @@ local function addRow(player)
 	-- low: и нож, и пистолет опознаны и оба ниже годли (для авто-блока)
 	local entry = { frame = row, high = false, low = false, blocked = false, addedAt = os.clock() }
 	rows[player] = entry
+
+	-- Видно, почему авто-блок пропустил игрока: друзей он не трогает (блок удалил бы из друзей)
+	function entry.setFriend(isFriendNow)
+		if entry.friend ~= isFriendNow then
+			entry.friend = isFriendNow
+			nameLabel.Text = isFriendNow and (name .. '  <font color="#7FD6FF">👥 друг — не блокирую</font>') or name
+		end
+	end
 
 	-- Себя заблокировать нельзя, у своей строки кнопки нет
 	if not isMe then
@@ -1544,7 +1566,11 @@ local function queueAutoBlocks()
 	-- Проверка дружбы ходит на сервер, поэтому после неё смотрим условия ещё раз
 	for _, player in ipairs(targets) do
 		local entry = rows[player]
-		if not isFriend(player) and autoBlock and entry and entry.low and hasNoHigh(entry) and not queue[player] then
+		local friend = isFriend(player)
+		if entry and entry.setFriend then
+			entry.setFriend(friend)
+		end
+		if not friend and autoBlock and entry and entry.low and hasNoHigh(entry) and not queue[player] then
 			-- nextTry с запасом: если за это время игрок окажется годли+ (докрутился атрибут
 			-- или подгрузился рюкзак), следующий тик очереди снимет его из очереди до блока
 			queue[player] = { block = true, nextTry = os.clock() + 3, auto = true }
