@@ -4,6 +4,7 @@
 -- Редкость скинов берётся из базы предметов игры (ReplicatedStorage.Database).
 -- Подсвечиваются игроки, у которых нож или пистолет выше Legendary.
 -- Кнопка «🚫 Авто» сама блокирует тех, у кого и нож, и пистолет ниже годли.
+-- Окно компактное, слева сверху, таскается за шапку; блок невидимый (см. INVISIBLE_BLOCK).
 -- Запуск в Delta: loadstring(readfile('reader.lua'))()
 
 local Players = game:GetService("Players")
@@ -12,6 +13,13 @@ local StarterGui = game:GetService("StarterGui")
 local CoreGui = game:GetService("CoreGui")
 local GuiService = game:GetService("GuiService")
 local _, VirtualInputManager = pcall(game.GetService, game, "VirtualInputManager") -- жать кнопку в окне Roblox
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+
+-- Окно блокировки Roblox не показывать: блок идёт невидимо, а что происходит — пишет сам ридер
+-- (строка под заголовком, а в свёрнутом виде — на кнопке «Игроки»). false — окно видно, как раньше
+local INVISIBLE_BLOCK = true
 
 -- Повторный запуск заменяет старое окно, а не плодит копии
 local env = (getgenv and getgenv()) or _G
@@ -358,50 +366,73 @@ end
 local gui = new("ScreenGui", {
 	Name = "ReaderGui",
 	ResetOnSpawn = false, -- не пропадает после смерти
-	IgnoreGuiInset = true, -- затемнение на весь экран
+	IgnoreGuiInset = true, -- координаты от самого верха экрана
 	DisplayOrder = 100, -- поверх интерфейса игры
 	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 })
 
+-- Прозрачный слой на весь экран: экран больше НЕ затемняется, клики мимо окна идут в игру
 local overlay = new("Frame", {
 	Name = "Overlay",
 	Size = UDim2.fromScale(1, 1),
-	BackgroundColor3 = Color3.new(0, 0, 0),
-	BackgroundTransparency = 0.4,
-	Active = true, -- нажатия не уходят в игру под окном
+	BackgroundTransparency = 1,
+	Active = false,
 	Parent = gui,
 })
 
+-- Компактное окно слева сверху. Таскается за шапку, место запоминается (reader_ui.json)
 local panel = new("Frame", {
 	Name = "Panel",
-	AnchorPoint = Vector2.new(0.5, 0.5),
-	Position = UDim2.fromScale(0.5, 0.5),
-	Size = UDim2.fromScale(0.7, 0.8),
+	Position = UDim2.fromOffset(12, 72),
+	Size = UDim2.fromScale(0.33, 0.56),
 	BackgroundColor3 = Color3.fromRGB(28, 28, 34),
+	Active = true, -- нажатия по окну не уходят в игру (нож/пистолет случайно не сработает)
 	Parent = overlay,
 })
 new("UICorner", { CornerRadius = UDim.new(0, 12), Parent = panel })
+new("UIStroke", { Color = Color3.fromRGB(70, 72, 90), Thickness = 1, Parent = panel })
 new("UISizeConstraint", {
-	MinSize = Vector2.new(300, 240),
-	MaxSize = Vector2.new(760, 560),
+	MinSize = Vector2.new(380, 240),
+	MaxSize = Vector2.new(540, 580),
 	Parent = panel,
 })
 new("UIPadding", {
-	PaddingTop = UDim.new(0, 14),
-	PaddingBottom = UDim.new(0, 14),
-	PaddingLeft = UDim.new(0, 16),
-	PaddingRight = UDim.new(0, 16),
+	PaddingTop = UDim.new(0, 10),
+	PaddingBottom = UDim.new(0, 10),
+	PaddingLeft = UDim.new(0, 12),
+	PaddingRight = UDim.new(0, 12),
 	Parent = panel,
 })
 
 local title = label({
 	Name = "Title",
-	Size = UDim2.new(1, -340, 0, 40),
+	Size = UDim2.new(1, -176, 0, 30),
 	Font = Enum.Font.GothamBold,
 	Text = "👥 Игроки",
-	TextSize = 24,
-	RichText = true, -- для цветного ID оператора в конце
+	TextSize = 20,
 	TextColor3 = Color3.fromRGB(240, 240, 245),
+	Parent = panel,
+})
+
+-- Строка под заголовком: код для exe, а во время блока — что сейчас происходит
+local subtitle = label({
+	Name = "Subtitle",
+	Position = UDim2.fromOffset(0, 30),
+	Size = UDim2.new(1, -176, 0, 18),
+	Font = Enum.Font.GothamMedium,
+	Text = "",
+	TextSize = 14,
+	TextColor3 = Color3.fromRGB(127, 214, 255),
+	Parent = panel,
+})
+
+-- За шапку окно перетаскивается (прозрачная ручка поверх заголовка)
+local dragBar = new("Frame", {
+	Name = "DragBar",
+	Size = UDim2.new(1, -176, 0, 48),
+	BackgroundTransparency = 1,
+	Active = true,
+	ZIndex = 5,
 	Parent = panel,
 })
 
@@ -409,12 +440,12 @@ local title = label({
 local autoButton = new("TextButton", {
 	Name = "StartButton",
 	AnchorPoint = Vector2.new(1, 0),
-	Position = UDim2.new(1, -52, 0, 0),
-	Size = UDim2.fromOffset(260, 40),
+	Position = UDim2.new(1, -46, 0, 2),
+	Size = UDim2.fromOffset(120, 40),
 	BackgroundColor3 = Color3.fromRGB(50, 140, 70),
 	Font = Enum.Font.GothamBold,
 	Text = "▶ Старт",
-	TextSize = 20,
+	TextSize = 18,
 	TextColor3 = Color3.new(1, 1, 1),
 	Parent = panel,
 })
@@ -424,8 +455,8 @@ new("UICorner", { CornerRadius = UDim.new(0, 8), Parent = autoButton })
 local closeButton = new("TextButton", {
 	Name = "CloseButton",
 	AnchorPoint = Vector2.new(1, 0),
-	Position = UDim2.fromScale(1, 0),
-	Size = UDim2.fromOffset(44, 40),
+	Position = UDim2.new(1, 0, 0, 2),
+	Size = UDim2.fromOffset(40, 40),
 	BackgroundColor3 = Color3.fromRGB(60, 60, 72),
 	Font = Enum.Font.GothamBold,
 	Text = "X", -- символа ✕ в шрифте Roblox нет, рисовался пустым квадратом
@@ -438,8 +469,9 @@ new("UICorner", { CornerRadius = UDim.new(0, 8), Parent = closeButton })
 local list = new("ScrollingFrame", {
 	Name = "List",
 	Position = UDim2.fromOffset(0, 52),
-	Size = UDim2.new(1, 0, 1, -58), -- на всю высоту, снизу небольшой отступ
+	Size = UDim2.new(1, 0, 1, -54), -- на всю высоту, снизу небольшой отступ
 	BackgroundTransparency = 1,
+	Active = true, -- прокрутка и клики по списку не уходят в игру
 	BorderSizePixel = 0,
 	ScrollBarThickness = 6,
 	CanvasSize = UDim2.new(),
@@ -464,31 +496,140 @@ local testStatus = label({
 	Parent = panel,
 })
 
--- После закрытия окна остаётся эта кнопка, чтобы открыть его снова
+-- Свёрнутое окно: кнопка на том же месте. Тоже таскается; на ней мигает статус блока
 local openButton = new("TextButton", {
 	Name = "OpenButton",
-	AnchorPoint = Vector2.new(0.5, 1),
-	Position = UDim2.new(0.5, 0, 1, -16),
+	Position = UDim2.fromOffset(12, 72),
 	Size = UDim2.fromOffset(150, 44),
 	BackgroundColor3 = Color3.fromRGB(28, 28, 34),
 	Font = Enum.Font.GothamBold,
 	Text = "👥 Игроки",
-	TextSize = 20,
+	TextScaled = true, -- длинный статус ужимается, а не обрезается
 	TextColor3 = Color3.new(1, 1, 1),
 	Visible = false,
 	Parent = gui,
 })
 new("UICorner", { CornerRadius = UDim.new(0, 10), Parent = openButton })
+new("UIStroke", {
+	Color = Color3.fromRGB(70, 72, 90),
+	Thickness = 1,
+	ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+	Parent = openButton,
+})
+new("UITextSizeConstraint", { MaxTextSize = 20, MinTextSize = 9, Parent = openButton })
+new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), Parent = openButton })
+
+-- Статус «что сейчас происходит»: под заголовком, а если окно свёрнуто — на кнопке.
+-- Через пару секунд возвращается обычный текст
+local flashToken = 0
+local function idleText()
+	subtitle.Text = "exe: " .. operatorId
+	openButton.Text = "👥 Игроки"
+end
+local function flash(text, seconds)
+	flashToken += 1
+	local my = flashToken
+	subtitle.Text = text
+	openButton.Text = text
+	task.delay(seconds or 2.5, function()
+		if flashToken == my then
+			idleText()
+		end
+	end)
+end
+idleText()
 
 -- Строки игроков
 
 local rows = {} -- [player] = { frame = Frame, high = есть ли скин выше Legendary, blocked = заблокирован ли }
 local connections = {}
 
+-- Окно и кнопка — один виджет: стоят в одной точке, двигаются вместе, точка запоминается
+local UI_FILE = "reader_ui.json"
+local uiSaved = {}
+pcall(function()
+	if isfile and isfile(UI_FILE) then
+		local data = HttpService:JSONDecode(readfile(UI_FILE))
+		if type(data) == "table" then
+			uiSaved = data
+		end
+	end
+end)
+if type(uiSaved.pos) == "table" and tonumber(uiSaved.pos[1]) and tonumber(uiSaved.pos[2]) then
+	local pos = UDim2.fromOffset(tonumber(uiSaved.pos[1]), tonumber(uiSaved.pos[2]))
+	panel.Position = pos
+	openButton.Position = pos
+end
+
+-- Не даём уехать за край экрана (в том числе после смены разрешения)
+local function clampToScreen(obj)
+	local screen, size = gui.AbsoluteSize, obj.AbsoluteSize
+	if screen.X <= 0 or size.X <= 0 then
+		return
+	end
+	obj.Position = UDim2.fromOffset(
+		math.clamp(obj.Position.X.Offset, 0, math.max(0, screen.X - size.X)),
+		math.clamp(obj.Position.Y.Offset, 0, math.max(0, screen.Y - size.Y))
+	)
+end
+
+local function rememberPosition(from)
+	local pos = from.Position
+	panel.Position = pos
+	openButton.Position = pos
+	uiSaved.pos = { pos.X.Offset, pos.Y.Offset }
+	pcall(writefile, UI_FILE, HttpService:JSONEncode(uiSaved))
+end
+
+-- handle — за что тянем, target — что двигаем. Возвращает функцию «это было перетаскивание?»,
+-- чтобы отпускание после перетаскивания не считалось нажатием кнопки
+local function makeDraggable(handle, target)
+	local dragging, moved, dragStart, startPos = false, false, nil, nil
+	table.insert(connections, handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, moved = true, false
+			dragStart = input.Position
+			startPos = target.Position
+		end
+	end))
+	table.insert(connections, UserInputService.InputChanged:Connect(function(input)
+		if not dragging then
+			return
+		end
+		if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then
+			return
+		end
+		local delta = input.Position - dragStart
+		if not moved and delta.Magnitude < 6 then
+			return -- дрожание пальца — ещё не перетаскивание
+		end
+		moved = true
+		target.Position = UDim2.fromOffset(startPos.X.Offset + delta.X, startPos.Y.Offset + delta.Y)
+		clampToScreen(target)
+	end))
+	table.insert(connections, UserInputService.InputEnded:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+			dragging = false
+			if moved then
+				rememberPosition(target)
+			end
+		end
+	end))
+	return function()
+		return moved
+	end
+end
+
 local function setOpen(isOpen)
 	overlay.Visible = isOpen
 	openButton.Visible = not isOpen
+	if isOpen then
+		task.defer(clampToScreen, panel) -- кнопку могли утащить к краю — окно целиком на экран
+	end
 end
+
+makeDraggable(dragBar, panel)
+local buttonDragged = makeDraggable(openButton, openButton)
 
 -- Блок обычный, как в меню Roblox, только без ручного подтверждения.
 -- Сам блок из Delta сделать нельзя: у Delta нет права RobloxScript, а require модулей
@@ -675,6 +816,91 @@ local function waitGone(label, seconds)
 	return not label:IsDescendantOf(game)
 end
 
+-- Невидимый блок: всё, что Roblox добавил за время блока в свои окна (Modal/Prompt/Dialog/Alert/
+-- Overlay/Toast/Notification), делаем полностью прозрачным. Элементы остаются на месте и работают:
+-- выбор+Enter и клик проходят, просто на экране ничего не видно. Окно появляется с анимацией,
+-- которая возвращает прозрачность, поэтому держим её каждый кадр. Меню Roblox, топбар и прочее не трогаем
+local HIDE_WHERE = { "Modal", "Prompt", "Dialog", "Alert", "Overlay", "Blocking", "Toast", "Notification" }
+local noSelectionBox = Instance.new("Frame") -- пустая рамка выбора: иначе вокруг кнопки видна обводка
+noSelectionBox.BackgroundTransparency = 1
+noSelectionBox.BorderSizePixel = 0
+
+local function hideNow(obj)
+	if obj:IsA("GuiObject") then
+		if obj.BackgroundTransparency ~= 1 then
+			obj.BackgroundTransparency = 1
+		end
+		if obj:IsA("TextLabel") or obj:IsA("TextButton") or obj:IsA("TextBox") then
+			if obj.TextTransparency ~= 1 then
+				obj.TextTransparency = 1
+			end
+			if obj.TextStrokeTransparency ~= 1 then
+				obj.TextStrokeTransparency = 1
+			end
+		elseif obj:IsA("ImageLabel") or obj:IsA("ImageButton") or obj:IsA("ViewportFrame") then
+			if obj.ImageTransparency ~= 1 then
+				obj.ImageTransparency = 1
+			end
+		end
+		if obj:IsA("GuiButton") and obj.SelectionImageObject ~= noSelectionBox then
+			obj.SelectionImageObject = noSelectionBox
+		end
+	elseif obj:IsA("UIStroke") then
+		if obj.Transparency ~= 1 then
+			obj.Transparency = 1
+		end
+	end
+end
+
+-- Возвращает { add = function(новый объект, полное имя), stop = function() }
+local hideCounter = 0
+local function startHidingBlockUi()
+	local items = {}
+	local warned = false
+	local function apply(obj)
+		if not pcall(hideNow, obj) and not warned then
+			warned = true
+			print("[Ридер] окно блокировки спрятать не вышло (не хватает прав инжектора) — будет видно")
+		end
+	end
+	hideCounter += 1
+	local bindName = "ReaderHideBlock" .. hideCounter
+	pcall(function()
+		RunService:BindToRenderStep(bindName, Enum.RenderPriority.Last.Value + 1, function()
+			pcall(function()
+				if setthreadidentity then
+					setthreadidentity(8) -- менять окна Roblox можно только с правами инжектора
+				end
+			end)
+			for i = #items, 1, -1 do
+				local obj = items[i]
+				if obj.Parent then
+					apply(obj)
+				else
+					table.remove(items, i)
+				end
+			end
+		end)
+	end)
+	return {
+		add = function(obj, fullName)
+			if not (obj:IsA("GuiObject") or obj:IsA("UIStroke")) then
+				return
+			end
+			for _, word in ipairs(HIDE_WHERE) do
+				if fullName:find(word, 1, true) then
+					items[#items + 1] = obj
+					apply(obj)
+					return
+				end
+			end
+		end,
+		stop = function()
+			pcall(RunService.UnbindFromRenderStep, RunService, bindName)
+		end,
+	}
+end
+
 -- Точное место нажатия неизвестно: с отступом верхней панели или без него.
 -- Водим мышь по вариантам и смотрим, когда кнопка подсветится (GuiState = Hover).
 -- Возвращает "clicked" (окно закрылось), "left" (игрок вышел, не жали) или "missed"
@@ -687,6 +913,11 @@ local function clickOn(label, playerLeft)
 	-- его кнопка активируется выбором (GuiService.SelectedObject) и клавишей Enter.
 	-- Пробуем это первым — так же надёжно жмётся и старое окно Roblox.
 	if button then
+		if INVISIBLE_BLOCK then
+			pcall(function()
+				button.SelectionImageObject = noSelectionBox -- без видимой рамки выбора
+			end)
+		end
 		local okSel = pcall(function()
 			GuiService.SelectedObject = button
 		end)
@@ -712,6 +943,10 @@ local function clickOn(label, playerLeft)
 			end)
 		end
 	end
+
+	-- Дальше жмём мышью по координатам: ридер на это время прячем, чтобы клик не попал в его окно
+	-- (окно ридера не затемняет экран и может стоять где угодно). Обратно включается после нажатия
+	gui.Enabled = false
 
 	-- На MEmu срабатывает центр + отступ верхней панели, его пробуем первым
 	local points = { center + inset, center, center - inset }
@@ -833,6 +1068,7 @@ local function closeDialog(candidates)
 			break
 		end
 	end
+	gui.Enabled = false -- клик по краю экрана не должен попасть в окно ридера (вернётся в finish)
 	local screen = workspace.CurrentCamera.ViewportSize
 	local point = Vector2.new(8, screen.Y / 2) + GuiService:GetGuiInset()
 	pcall(function()
@@ -890,18 +1126,32 @@ local function setBlockedAsync(player, block)
 	end
 
 	local candidates = {}
+	local hider = INVISIBLE_BLOCK and startHidingBlockUi() or nil
 	local watcher = CoreGui.DescendantAdded:Connect(function(obj)
 		-- Чат и сам ридер не трогаем: там могут быть слова «block», «error» и т.п.
-		if (obj:IsA("TextLabel") or obj:IsA("TextButton"))
-			and not obj:IsDescendantOf(gui)
-			and not obj:GetFullName():find("Chat", 1, true)
-		then
+		if obj:IsDescendantOf(gui) then
+			return
+		end
+		local fullName = obj:GetFullName()
+		if fullName:find("Chat", 1, true) then
+			return
+		end
+		if hider then
+			hider.add(obj, fullName)
+		end
+		if obj:IsA("TextLabel") or obj:IsA("TextButton") then
 			table.insert(candidates, obj)
 		end
 	end)
 	local function finish(success, reason)
-		watcher:Disconnect()
 		gui.Enabled = true
+		-- Прячем ещё полторы секунды: после блока Roblox может показать всплывашку «заблокирован»
+		task.delay(hider and 1.5 or 0, function()
+			watcher:Disconnect()
+			if hider then
+				hider.stop()
+			end
+		end)
 		if success then
 			if block then
 				table.insert(recentBlocks, os.time())
@@ -916,8 +1166,8 @@ local function setBlockedAsync(player, block)
 		return success, reason
 	end
 
-	-- Ридер выше окна Roblox, без этого нажатие попало бы в него
-	gui.Enabled = false
+	-- Ридер остаётся на экране и пишет статус. Если понадобится жать мышью по координатам,
+	-- clickOn сам спрячет его на время нажатия
 	lastBlockEvent[player.UserId] = nil
 	local ok, err = pcall(StarterGui.SetCore, StarterGui, block and "PromptBlockPlayer" or "PromptUnblockPlayer", player)
 	if not ok then
@@ -967,6 +1217,7 @@ local function setBlockedAsync(player, block)
 	local clickIndex = #candidates -- всё, что появится дальше, это ответ Roblox на нажатие
 	local clickTime = os.clock()
 	local click, presses = clickOn(label, playerLeft)
+	gui.Enabled = true -- если жали мышью, ридер был спрятан на время нажатия
 	if click == "left" then
 		closeDialog(candidates) -- игрока уже нет, блок не тратим
 		return finish(false, "left")
@@ -1106,9 +1357,8 @@ local function updateTitle()
 	for _ in pairs(queue) do
 		queued += 1
 	end
-	title.Text = "👥 Игроки (" .. count .. ")" .. (high > 0 and ("   ★ " .. high) or "")
-		.. (queued > 0 and ("   ⏳ " .. queued) or "")
-		.. '   <font color="#7FD6FF" size="16">exe: ' .. operatorId .. "</font>"
+	title.Text = "👥 Игроки (" .. count .. ")" .. (high > 0 and ("  ★ " .. high) or "")
+		.. (queued > 0 and ("  ⏳ " .. queued) or "") -- код для exe — строкой ниже (subtitle)
 end
 
 -- Одна попытка блока с результатом на кнопке. Кого не вышло, ставим в очередь
@@ -1118,6 +1368,7 @@ local function runBlock(player, block)
 	if entry and entry.showStatus then
 		entry.showStatus("...")
 	end
+	flash((block and "⏳ Блокирую @" or "⏳ Снимаю блок @") .. player.Name, 20)
 	if not block then
 		-- Разблокировка: намерение «он НЕ заблокирован» фиксируем СРАЗУ и в файл, ещё до запроса.
 		-- Даже если запрос к Roblox упадёт (пустое окно/фантом) — при перезаходе не будет висеть
@@ -1140,6 +1391,7 @@ local function runBlock(player, block)
 		if entry and entry.showStatus then
 			entry.showStatus("✓ Снято", 1.5)
 		end
+		flash("✓ Блок снят: @" .. player.Name)
 		return
 	end
 
@@ -1171,6 +1423,17 @@ local function runBlock(player, block)
 		queue[player] = { block = block, nextTry = os.clock() + delay, fails = fails, auto = old and old.auto }
 	end
 	updateTitle()
+
+	-- Итог пишем и в окно ридера (окно Roblox теперь невидимое)
+	if ok then
+		flash("✓ Заблокирован: @" .. player.Name)
+	elseif reason == "left" then
+		flash("Вышел до блока: @" .. player.Name, 3)
+	elseif reason == "limit" then
+		flash("⏳ Лимит Roblox — @" .. player.Name .. " в очереди", 4)
+	else
+		flash("Не вышло, повторю: @" .. player.Name, 3)
+	end
 
 	entry = rows[player]
 	if entry and entry.showStatus then
@@ -1941,6 +2204,9 @@ closeButton.Activated:Connect(function()
 	setOpen(false)
 end)
 openButton.Activated:Connect(function()
+	if buttonDragged() then
+		return -- кнопку перетаскивали, а не нажимали
+	end
 	setOpen(true)
 	refreshBlocked() -- вдруг кого-то блокнули через меню Roblox
 end)
@@ -1960,6 +2226,15 @@ end
 
 env.ReaderGui = gui
 setOpen(true)
+-- Сохранённое место могло остаться от другого разрешения — поджимаем к экрану
+task.defer(function()
+	clampToScreen(openButton)
+	clampToScreen(panel)
+end)
+table.insert(connections, gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+	clampToScreen(openButton)
+	clampToScreen(panel)
+end))
 
 -- Отчёт для проверки: какую редкость нашли у надетых скинов
 local report = { "таблиц в базе: " .. #itemTables }
