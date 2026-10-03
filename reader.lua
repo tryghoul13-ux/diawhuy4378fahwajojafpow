@@ -27,9 +27,59 @@ local HIDE_DEBUG = false
 
 -- Повторный запуск заменяет старое окно, а не плодит копии
 local env = (getgenv and getgenv()) or _G
+local rerun = env.ReaderGui ~= nil -- ридер перезапустили в той же игре (не после вылета)
 if env.ReaderGui then
 	env.ReaderGui:Destroy()
 end
+
+-- Журналы ридера: строка дописывается в конец файла, а разросшийся файл обрезается до последней половины
+local LOG_MAX = 200000 -- байт
+local function appendLog(file, line)
+	pcall(function()
+		local old = (isfile and isfile(file)) and readfile(file) or ""
+		if #old > LOG_MAX then
+			old = old:sub(-math.floor(LOG_MAX / 2))
+			old = old:sub((old:find("\n", 1, true) or 0) + 1) -- с начала строки
+		end
+		writefile(file, old .. line)
+	end)
+end
+
+-- Ошибка в фоновом цикле не должна его останавливать: пишем её в консоль и в reader_errors.txt
+-- (одно и то же место — не чаще раза в 10 с), а цикл идёт дальше
+local lastErrorAt = {}
+local function reportError(where, err)
+	local now = os.clock()
+	if lastErrorAt[where] and now - lastErrorAt[where] < 10 then
+		return
+	end
+	lastErrorAt[where] = now
+	print("[Ридер] ошибка (" .. where .. "):", err)
+	appendLog("reader_errors.txt", ("%s | %s | %s\n"):format(os.date("%Y-%m-%d %H:%M:%S"), where, tostring(err)))
+end
+
+-- Защита от вылетов: перед рискованным шагом блока пишем его название в reader_state.txt, после — стираем.
+-- Если Roblox закрылся посреди шага, при следующем запуске файл не пустой: ридер записывает это
+-- в reader_crash.txt, а если упало на прямом нажатии — выключает его насовсем
+local STATE_FILE = "reader_state.txt"
+local stageNow = ""
+local function setStage(stage)
+	stage = stage or ""
+	if stage ~= stageNow then
+		stageNow = stage
+		pcall(writefile, STATE_FILE, stage)
+	end
+end
+local crashedAt -- на каком шаге оборвался прошлый запуск; nil — закрылся нормально
+pcall(function()
+	if isfile and isfile(STATE_FILE) then
+		local text = readfile(STATE_FILE):gsub("%s", "")
+		if text ~= "" then
+			crashedAt = text
+		end
+	end
+end)
+pcall(writefile, STATE_FILE, "")
 
 -- ID оператора: по нему exe на ПК находит именно эту панель. Создаётся один раз,
 -- хранится в operator_id.txt рядом с ридером. Показывается в окне, чтобы вставить в exe
@@ -641,6 +691,18 @@ local function saveUi()
 	pcall(writefile, UI_FILE, HttpService:JSONEncode(uiSaved))
 end
 
+-- Прошлый запуск оборвался посреди блока (см. reader_state.txt в начале)
+if crashedAt and not rerun then
+	appendLog("reader_crash.txt", ("%s | прошлый запуск оборвался на шаге блока: %s\n"):format(
+		os.date("%Y-%m-%d %H:%M:%S"), crashedAt))
+	print("[Ридер] прошлый запуск оборвался на шаге блока:", crashedAt)
+	if crashedAt == "direct" then
+		uiSaved.noDirect = true -- прямое нажатие больше не используем, жмём выбором+Enter
+		saveUi()
+		flash("⚠ Прошлый раз упало на прямом нажатии — выключил его", 10)
+	end
+end
+
 local function rememberPosition(from)
 	local pos = from.Position
 	panel.Position = pos
@@ -1002,30 +1064,48 @@ local GUARDED = {
 	UIStroke = { "Transparency" },
 }
 
--- Возвращает { add = function(новый объект, полное имя), release = function(), stop = function() }
+-- Возвращает { add = function(новый объект, полное имя), release = function(), stop = function(окно ещё открыто) }
 local hideCounter = 0
 local function startHidingBlockUi()
 	local items = {}
 	local guards = {}
 	local released = false
 	local warned = false
+	local elevateUseless = false
 	local function apply(obj)
-		if not pcall(hideNow, obj) and not warned then
+		if pcall(hideNow, obj) then
+			return
+		end
+		-- Не хватило прав потока: поднимаем их и пробуем ещё раз. Только когда правда нужно —
+		-- раньше права поднимались каждый кадр на всякий случай, а это лишний риск вылета
+		if setthreadidentity and not elevateUseless then
+			if pcall(setthreadidentity, 8) and pcall(hideNow, obj) then
+				return
+			end
+			elevateUseless = true
+		end
+		if not warned then
 			warned = true
 			print("[Ридер] окно блокировки спрятать не вышло (не хватает прав инжектора) — будет видно")
 		end
 	end
 	-- После нажатия окно Roblox ещё висит, пока ждёт ответа сервера. Его невидимое затемнение
 	-- на весь экран ловит касания — на телефоне из-за него не работает джойстик. Отпускаем:
-	-- большие элементы окна больше не перехватывают нажатия
+	-- большие элементы окна больше не перехватывают нажатия. Что отключили — вернём в stop,
+	-- если элемент Roblox остался жить (иначе следующие окна Roblox могли бы не нажиматься)
+	local disabled = {} -- [obj] = { Active = было, Interactable = было }
 	local function letInputThrough(obj)
 		pcall(function()
 			local screen, size = gui.AbsoluteSize, obj.AbsoluteSize
 			if size.X >= screen.X * 0.8 and size.Y >= screen.Y * 0.8 then
 				if obj.Active then
+					disabled[obj] = disabled[obj] or {}
+					disabled[obj].Active = true
 					obj.Active = false
 				end
 				if obj.Interactable then
+					disabled[obj] = disabled[obj] or {}
+					disabled[obj].Interactable = true
 					obj.Interactable = false
 				end
 			end
@@ -1035,11 +1115,6 @@ local function startHidingBlockUi()
 	local bindName = "ReaderHideBlock" .. hideCounter
 	pcall(function()
 		RunService:BindToRenderStep(bindName, Enum.RenderPriority.Last.Value + 1, function()
-			pcall(function()
-				if setthreadidentity then
-					setthreadidentity(8) -- менять окна Roblox можно только с правами инжектора
-				end
-			end)
 			for i = #items, 1, -1 do
 				local obj = items[i]
 				if obj.Parent then
@@ -1095,12 +1170,30 @@ local function startHidingBlockUi()
 				end
 			end
 		end,
-		stop = function()
+		-- dialogStillOpen: окно Roblox так и не закрылось — тогда его невидимое затемнение
+		-- оставляем пропускающим нажатия, иначе оно перекроет управление
+		stop = function(dialogStillOpen)
 			pcall(RunService.UnbindFromRenderStep, RunService, bindName)
 			for _, connection in ipairs(guards) do
-				connection:Disconnect()
+				pcall(function()
+					connection:Disconnect()
+				end)
 			end
 			table.clear(guards)
+			table.clear(items)
+			for obj, was in pairs(disabled) do
+				if obj.Parent and not dialogStillOpen then
+					pcall(function()
+						if was.Active then
+							obj.Active = true
+						end
+						if was.Interactable then
+							obj.Interactable = true
+						end
+					end)
+				end
+			end
+			table.clear(disabled)
 		end,
 	}
 end
@@ -1117,6 +1210,7 @@ local function clickOn(label, playerLeft)
 	-- его кнопка активируется выбором (GuiService.SelectedObject) и клавишей Enter.
 	-- Пробуем это первым — так же надёжно жмётся и старое окно Roblox.
 	if button then
+		setStage("select")
 		if INVISIBLE_BLOCK then
 			pcall(function()
 				button.SelectionImageObject = noSelectionBox -- без видимой рамки выбора
@@ -1152,6 +1246,7 @@ local function clickOn(label, playerLeft)
 
 	-- Дальше жмём мышью по координатам: ридер на это время прячем, чтобы клик не попал в его окно
 	-- (окно ридера не затемняет экран и может стоять где угодно). Обратно включается после нажатия
+	setStage("mouse")
 	gui.Enabled = false
 
 	-- На MEmu срабатывает центр + отступ верхней панели, его пробуем первым
@@ -1216,17 +1311,19 @@ local function clickOn(label, playerLeft)
 		if playerLeft() then
 			return "left", presses
 		end
-		-- Мышь не сработала, пробуем касанием
-		pcall(function()
-			VirtualInputManager:SendTouchEvent(7, 0, point.X, point.Y)
-			task.wait(0.05)
-			VirtualInputManager:SendTouchEvent(7, 2, point.X, point.Y)
-		end)
-		presses += 1
-		if waitGone(label, 1.5) then
-			workingOffset = point - center
-			print("[Ридер] нажали касанием в", point)
-			return "clicked", presses
+		-- Мышь не сработала, пробуем касанием (только где есть сенсор: на ПК поддельное касание ни к чему)
+		if UserInputService.TouchEnabled then
+			pcall(function()
+				VirtualInputManager:SendTouchEvent(7, 0, point.X, point.Y)
+				task.wait(0.05)
+				VirtualInputManager:SendTouchEvent(7, 2, point.X, point.Y)
+			end)
+			presses += 1
+			if waitGone(label, 1.5) then
+				workingOffset = point - center
+				print("[Ридер] нажали касанием в", point)
+				return "clicked", presses
+			end
 		end
 	end
 	return "missed", presses
@@ -1259,8 +1356,21 @@ local function closeDialog(candidates)
 	if not dialogOpen(candidates) then
 		return true
 	end
+	-- Escape закрывает окно; но если окно Roblox на Escape не отвечает (или уже закрылось),
+	-- Escape открывает меню игры — тогда сразу закрываем меню обратно
+	local function menuOpen()
+		local ok, open = pcall(function()
+			return GuiService.MenuIsOpen
+		end)
+		return ok and open == true
+	end
+	local menuWasOpen = menuOpen()
 	pressEscape()
 	task.wait(0.5)
+	if not menuWasOpen and menuOpen() then
+		pressEscape()
+		task.wait(0.3)
+	end
 	if not dialogOpen(candidates) then
 		return true
 	end
@@ -1313,52 +1423,58 @@ end
 local function logBlock(player, block, result)
 	local line = ("%s | %s | %s (%d) | %s\n"):format(
 		os.date("%Y-%m-%d %H:%M:%S"), block and "блок" or "разблок", player.Name, player.UserId, result)
-	pcall(function()
-		local old = (isfile and isfile("block_log.txt")) and readfile("block_log.txt") or ""
-		writefile("block_log.txt", old .. line)
-	end)
+	appendLog("block_log.txt", line) -- раньше файл рос бесконечно и переписывался целиком на каждый блок
 	print("[Ридер] " .. line)
 end
 
--- Прямое нажатие кнопки окна Roblox: вызываем её обработчик через getconnections/firesignal
--- (если инжектор умеет). Без выбора, Enter и мыши: игра не рисует рамку выбора и не забирает
--- управление персонажем. Возвращает true, если какой-то обработчик удалось вызвать
-local directMode = "untested" -- "immediate": работает сразу; "settled": после анимации окна; "broken": не работает
+-- Прямое нажатие кнопки окна Roblox: вызываем её обработчик через getconnections (если инжектор
+-- умеет). Без выбора, Enter и мыши: игра не рисует рамку выбора и не забирает управление персонажем.
+-- Вызываем ТОЛЬКО обычные Lua-обработчики. Встроенные (C) и из чужого состояния Lua не трогаем:
+-- их вызов через инжектор может уронить Roblox целиком. firesignal не используем по той же
+-- причине. Возвращает true, если какой-то обработчик удалось вызвать
+-- "immediate": работает сразу; "settled": после анимации окна; "broken": не работает или выключено
+-- после вылета (uiSaved.noDirect)
+local directMode = uiSaved.noDirect and "broken" or "untested"
+
+local function isLuaFunction(fn)
+	if type(fn) ~= "function" then
+		return false
+	end
+	if iscclosure then
+		local ok, isC = pcall(iscclosure, fn)
+		if ok then
+			return not isC
+		end
+	end
+	local ok, source = pcall(debug.info, fn, "s")
+	return ok and type(source) == "string" and source ~= "[C]"
+end
+
 local function fireButton(button)
-	if not button then
+	if not (button and getconnections) then
 		return false
 	end
 	for _, signalName in ipairs({ "Activated", "MouseButton1Click" }) do
-		local okSig, signal = pcall(function()
-			return button[signalName]
+		local okC, conns = pcall(function()
+			return getconnections(button[signalName])
 		end)
-		if okSig and signal then
+		if okC and type(conns) == "table" then
 			local called = false
-			if getconnections then
-				local okC, conns = pcall(getconnections, signal)
-				if okC and type(conns) == "table" then
-					for _, conn in ipairs(conns) do
-						-- Fire запускает обработчик в его собственном потоке (с правами Roblox), Function — в нашем
-						local okF, fire = pcall(function()
-							return conn.Fire
-						end)
-						local okCall = false
-						if okF and type(fire) == "function" then
-							okCall = pcall(fire, conn)
-						else
-							local okG, fn = pcall(function()
-								return conn.Function
-							end)
-							if okG and type(fn) == "function" then
-								okCall = pcall(fn)
-							end
-						end
-						called = called or okCall
+			for _, conn in ipairs(conns) do
+				local okInfo, fn, foreign, isLua, fire = pcall(function()
+					return conn.Function, conn.ForeignState, conn.LuaConnection, conn.Fire
+				end)
+				-- Только точно Lua-обработчик из нашего состояния: его функция нам видна и это не C
+				if okInfo and foreign ~= true and isLua ~= false and isLuaFunction(fn) then
+					-- Fire запускает обработчик с правами Roblox (в его потоке), Function — в нашем
+					local okCall = false
+					if type(fire) == "function" then
+						okCall = pcall(fire, conn)
+					else
+						okCall = pcall(fn)
 					end
+					called = called or okCall
 				end
-			end
-			if not called and firesignal then
-				called = pcall(firesignal, signal)
 			end
 			if called then
 				return true -- одного сигнала хватит, иначе блок уйдёт дважды
@@ -1368,44 +1484,14 @@ local function fireButton(button)
 	return false
 end
 
--- Блокирует или разблокирует. Возвращает true или false и причину:
--- "left" игрок вышел, "limit" Roblox отказал (лимит блоков), "failed" не получилось нажать
--- (окно закрыто), "notblocked" окно закрылось, но в списке Roblox разблока нет, "noprompt" окно не открылось
-local function setBlockedAsync(player, block)
+-- Ход одного блока: открыть окно Roblox, нажать в нём кнопку, дождаться ответа. Слежку за окнами
+-- (candidates — надписи, появившиеся в CoreGui) и невидимость окна (hider) ведёт setBlockedAsync ниже:
+-- она же убирает их за собой, даже если здесь посреди блока случилась ошибка
+local function blockSteps(player, block, candidates, hider)
 	local function playerLeft()
 		return player.Parent ~= Players
 	end
-	if playerLeft() then
-		return false, "left"
-	end
-
-	local candidates = {}
-	local hider = INVISIBLE_BLOCK and startHidingBlockUi() or nil
-	local watcher = CoreGui.DescendantAdded:Connect(function(obj)
-		-- Чат и сам ридер не трогаем: там могут быть слова «block», «error» и т.п.
-		if obj:IsDescendantOf(gui) then
-			return
-		end
-		local fullName = obj:GetFullName()
-		if fullName:find("Chat", 1, true) then
-			return
-		end
-		if hider then
-			hider.add(obj, fullName)
-		end
-		if obj:IsA("TextLabel") or obj:IsA("TextButton") then
-			table.insert(candidates, obj)
-		end
-	end)
 	local function finish(success, reason)
-		gui.Enabled = true
-		-- Прячем ещё полторы секунды: после блока Roblox может показать всплывашку «заблокирован»
-		task.delay(hider and 1.5 or 0, function()
-			watcher:Disconnect()
-			if hider then
-				hider.stop()
-			end
-		end)
 		if success then
 			if block then
 				table.insert(recentBlocks, os.time())
@@ -1463,7 +1549,7 @@ local function setBlockedAsync(player, block)
 
 	-- Прямое нажатие: "took" — запрос ушёл (событие/отметка Roblox или его ответ-ошибка),
 	-- "closed" — окно закрылось без признаков блока, "nothing" — не сработало, окно висит
-	local function tryDirect()
+	local function pressDirect()
 		local before = rawBlocked(player.UserId)
 		if not fireButton(buttonOf(label)) then
 			return "nothing"
@@ -1483,6 +1569,17 @@ local function setBlockedAsync(player, block)
 			end
 		until os.clock() > stopAt
 		return label:IsDescendantOf(game) and "nothing" or "closed"
+	end
+	local function tryDirect()
+		setStage("direct") -- упадёт Roblox прямо здесь — следующий запуск прямое нажатие выключит
+		local result = pressDirect()
+		-- Отметку держим ещё чуть-чуть: последствия нажатия (перерисовка окна) идут в следующих кадрах
+		task.delay(0.3, function()
+			if stageNow == "direct" then
+				setStage(nil)
+			end
+		end)
+		return result
 	end
 	-- true — окно закрылось без блока, жать уже нечего
 	local function directResult(result, mode)
@@ -1535,6 +1632,7 @@ local function setBlockedAsync(player, block)
 
 	if not click then
 		click, presses = clickOn(label, playerLeft)
+		setStage(nil)
 		gui.Enabled = true -- если жали мышью, ридер был спрятан на время нажатия
 	end
 	if click == "clicked" and hider then
@@ -1628,6 +1726,57 @@ local function setBlockedAsync(player, block)
 	return finish(false, block and "notblocked" or "stillblocked")
 end
 
+-- Блокирует или разблокирует. Возвращает true или false и причину:
+-- "left" игрок вышел, "limit" Roblox отказал (лимит блоков), "failed" не получилось нажать
+-- (окно закрыто), "notblocked" окно закрылось, но в списке Roblox разблока нет, "noprompt" окно не открылось.
+-- Ошибку посреди блока пробрасывает дальше, но слежку и невидимость окна выключает в любом случае:
+-- раньше после ошибки они оставались навсегда и прятали любые новые окна Roblox
+local function setBlockedAsync(player, block)
+	if player.Parent ~= Players then
+		return false, "left"
+	end
+
+	local candidates = {}
+	local hider = INVISIBLE_BLOCK and startHidingBlockUi() or nil
+	local watcher = CoreGui.DescendantAdded:Connect(function(obj)
+		-- Чат и сам ридер не трогаем: там могут быть слова «block», «error» и т.п.
+		if obj:IsDescendantOf(gui) then
+			return
+		end
+		local fullName = obj:GetFullName()
+		if fullName:find("Chat", 1, true) then
+			return
+		end
+		if obj:IsA("TextLabel") or obj:IsA("TextButton") then
+			table.insert(candidates, obj)
+		end
+		if hider then
+			pcall(hider.add, obj, fullName)
+		end
+	end)
+
+	local called, ok, reason = pcall(blockSteps, player, block, candidates, hider)
+	setStage(nil)
+	gui.Enabled = true -- clickOn/closeDialog могли спрятать ридер на время нажатия мышью
+	-- Прячем ещё полторы секунды: после блока Roblox может показать всплывашку «заблокирован»
+	task.delay(hider and 1.5 or 0, function()
+		pcall(function()
+			watcher:Disconnect()
+		end)
+		if hider then
+			local stillOpen = false
+			pcall(function()
+				stillOpen = dialogOpen(candidates)
+			end)
+			hider.stop(stillOpen)
+		end
+	end)
+	if not called then
+		error(ok, 0)
+	end
+	return ok, reason
+end
+
 -- Если блокнули или разблокнули через меню Roblox
 local function onBlockChanged(isBlocked)
 	return function(player)
@@ -1684,7 +1833,7 @@ local function updateTitle()
 end
 
 -- Одна попытка блока с результатом на кнопке. Кого не вышло, ставим в очередь
-local function runBlock(player, block)
+local function runBlockSteps(player, block)
 	blockInProgress = true
 	local entry = rows[player]
 	if entry and entry.showStatus then
@@ -1701,7 +1850,7 @@ local function runBlock(player, block)
 	local called, ok, reason = pcall(setBlockedAsync, player, block)
 	blockInProgress = false
 	if not called then
-		print("[Ридер] ошибка в блоке:", ok)
+		reportError("блок", ok)
 		gui.Enabled = true
 		ok, reason = false, "failed"
 	end
@@ -1766,6 +1915,16 @@ local function runBlock(player, block)
 		else
 			entry.showStatus(reason == "limit" and "Лимит" or "Ещё раз", 2)
 		end
+	end
+end
+
+-- Ошибка где угодно в попытке не должна оставить ридер «занятым» навсегда (очередь бы встала)
+local function runBlock(player, block)
+	local ok, err = pcall(runBlockSteps, player, block)
+	blockInProgress = false
+	if not ok then
+		gui.Enabled = true
+		reportError("блок", err)
 	end
 end
 
@@ -2236,16 +2395,30 @@ local function removeRow(player)
 	-- Забываем РУЧНОЕ решение «не блокировать» — чтобы при повторном входе автоблок сработал снова
 	autoSkip[player.UserId] = nil
 	friendCache[player.UserId] = nil -- дружбу тоже перепроверим при повторном входе
+	invDebug[player.Name] = nil -- разбор рюкзака ушедших не копим (иначе растёт весь вечер)
 	-- serverUnblocked НЕ сбрасываем: если сервер сказал «блока нет», это верно и после перезахода,
 	-- иначе залипший список Roblox снова пометил бы его заблокированным и автоблок бы его пропустил
 	updateTitle()
 end
 
-for _, player in ipairs(Players:GetPlayers()) do
-	addRow(player)
+-- Сбой на одном игроке (странные данные) не должен ломать остальных
+local function safeAddRow(player)
+	local ok, err = pcall(addRow, player)
+	if not ok then
+		reportError("строка @" .. player.Name, err)
+	end
 end
-table.insert(connections, Players.PlayerAdded:Connect(addRow))
-table.insert(connections, Players.PlayerRemoving:Connect(removeRow))
+local function safeRemoveRow(player)
+	local ok, err = pcall(removeRow, player)
+	if not ok then
+		reportError("уход @" .. player.Name, err)
+	end
+end
+for _, player in ipairs(Players:GetPlayers()) do
+	safeAddRow(player)
+end
+table.insert(connections, Players.PlayerAdded:Connect(safeAddRow))
+table.insert(connections, Players.PlayerRemoving:Connect(safeRemoveRow))
 
 -- Авто-блок: ставит в очередь всех, у кого и нож, и пистолет ниже годли.
 -- Только что зашедших 10 с не трогаем: пока MM2 грузит их данные, могут висеть стандартные скины
@@ -2281,61 +2454,78 @@ local function queueAutoBlocks()
 	end
 end
 
--- Очередь: раз в секунду обновляет отсчёт на кнопках и сама запускает тех, чьё время пришло
+-- Очередь: раз в секунду обновляет отсчёт на кнопках и сама запускает тех, чьё время пришло.
+-- Ошибка в одном тике не останавливает очередь: пишется в reader_errors.txt, следующий тик идёт как обычно
 local alive = true
+local function queueTick(tick)
+	-- Раз в ~6 с сверяем кнопки с реальным списком Roblox: если игрок на самом деле
+	-- НЕ заблокирован, а кнопка висит «Снять блок», она сама вернётся в «🚫 Блок».
+	-- Во время самого блока не трогаем, чтобы не мешать его проверке
+	if tick % 6 == 0 and not blockInProgress and not testRunning then
+		pcall(refreshBlocked)
+	end
+	for player, item in pairs(queue) do
+		-- Вышел с сервера, уже в нужном состоянии (например, блокнули через меню Roblox)
+		-- или, если блок авто, у него обнаружился годли+ (надел или нашёлся в рюкзаке)
+		if player.Parent ~= Players or (blockedIds[player.UserId] == true) == item.block
+			or (item.auto and not (rows[player] and rows[player].low and hasNoHigh(rows[player])))
+		then
+			queue[player] = nil
+			updateTitle()
+		end
+	end
+	if autoBlock then
+		queueAutoBlocks()
+	end
+	for _, entry in pairs(rows) do
+		if entry.refreshButton then
+			entry.refreshButton()
+		end
+	end
+	if not blockInProgress and not testRunning then -- во время замера очередь ждёт
+		local due, dueItem
+		for player, item in pairs(queue) do
+			if os.clock() >= item.nextTry and (not dueItem or item.nextTry < dueItem.nextTry) then
+				due, dueItem = player, item
+			end
+		end
+		if due then
+			runBlock(due, dueItem.block)
+		end
+	end
+end
 task.spawn(function()
 	local tick = 0
 	while alive do
 		task.wait(1)
 		tick += 1
-		-- Раз в ~6 с сверяем кнопки с реальным списком Roblox: если игрок на самом деле
-		-- НЕ заблокирован, а кнопка висит «Снять блок», она сама вернётся в «🚫 Блок».
-		-- Во время самого блока не трогаем, чтобы не мешать его проверке
-		if tick % 6 == 0 and not blockInProgress and not testRunning then
-			pcall(refreshBlocked)
-		end
-		for player, item in pairs(queue) do
-			-- Вышел с сервера, уже в нужном состоянии (например, блокнули через меню Roblox)
-			-- или, если блок авто, у него обнаружился годли+ (надел или нашёлся в рюкзаке)
-			if player.Parent ~= Players or (blockedIds[player.UserId] == true) == item.block
-				or (item.auto and not (rows[player] and rows[player].low and hasNoHigh(rows[player])))
-			then
-				queue[player] = nil
-				updateTitle()
-			end
-		end
-		if autoBlock then
-			queueAutoBlocks()
-		end
-		for player, entry in pairs(rows) do
-			if entry.refreshButton then
-				entry.refreshButton()
-			end
-		end
-		if not blockInProgress and not testRunning then -- во время замера очередь ждёт
-			local due, dueItem
-			for player, item in pairs(queue) do
-				if os.clock() >= item.nextTry and (not dueItem or item.nextTry < dueItem.nextTry) then
-					due, dueItem = player, item
-				end
-			end
-			if due then
-				runBlock(due, dueItem.block)
-			end
+		local ok, err = pcall(queueTick, tick)
+		if not ok then
+			reportError("очередь", err)
 		end
 	end
 end)
 
 -- Подсчёт рюкзака игрока: берём инвентарь через GetFullInventory, суммируем цену владеемого.
 -- Это ровно то, что открывает кнопка «Inventory» в игре, просто сразу с ценами
+local INV_TIMEOUT = 15 -- с: сервер не ответил — бросаем и пробуем позже, а не висим вечно
 local function fetchInventory(player)
 	if not invRemote then
 		return
 	end
-	local ok, inv = pcall(function()
-		return invRemote:InvokeServer(player)
+	-- Сам запрос — в отдельном потоке: если сервер так и не ответит, воркер рюкзаков не встанет навсегда
+	local done, ok, inv = false, false, nil
+	task.spawn(function()
+		ok, inv = pcall(function()
+			return invRemote:InvokeServer(player)
+		end)
+		done = true
 	end)
-	if not ok or type(inv) ~= "table" then
+	local deadline = os.clock() + INV_TIMEOUT
+	while not done and os.clock() < deadline do
+		task.wait(0.1)
+	end
+	if not done or not ok or type(inv) ~= "table" then
 		return false -- не вышло (ошибка/лимит) — воркер попробует позже
 	end
 	local owned = type(inv.Weapons) == "table" and inv.Weapons.Owned
@@ -2391,20 +2581,29 @@ end
 local invTries = {}
 task.spawn(function()
 	while alive do
-		local player = table.remove(invQueue, 1)
-		if player and player.Parent == Players and rows[player] and not (rows[player].invItems) then
-			local ok = fetchInventory(player)
-			if ok == false then
-				invTries[player] = (invTries[player] or 0) + 1
-				if invTries[player] < 4 then
-					table.insert(invQueue, player) -- попробуем ещё раз позже
+		local okStep, err = pcall(function()
+			local player = table.remove(invQueue, 1)
+			if player and player.Parent == Players and rows[player] and not (rows[player].invItems) then
+				local ok = fetchInventory(player)
+				if ok == false then
+					invTries[player] = (invTries[player] or 0) + 1
+					if invTries[player] < 4 then
+						table.insert(invQueue, player) -- попробуем ещё раз позже
+					else
+						invTries[player] = nil
+					end
+					task.wait(2)
+				else
+					invTries[player] = nil
+					task.wait(0.5)
 				end
-				task.wait(2)
 			else
-				task.wait(0.5)
+				task.wait(0.4)
 			end
-		else
-			task.wait(0.4)
+		end)
+		if not okStep then
+			reportError("рюкзаки", err)
+			task.wait(2)
 		end
 	end
 end)
@@ -2492,22 +2691,25 @@ task.spawn(function()
 	local lastMove = os.clock()
 	while alive do
 		task.wait(1)
-		local character = Players.LocalPlayer.Character
-		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-		local root = character and character:FindFirstChild("HumanoidRootPart")
-		if not (humanoid and root) or humanoid.Health <= 0 then
-			lastMove = os.clock() -- персонажа нет (респавн, между раундами) — ждём
-		elseif humanoid.MoveDirection.Magnitude > 0.1 then
-			lastMove = os.clock() -- игрок ходит сам — не мешаем
-		elseif os.clock() - lastMove >= ANTI_AFK_EVERY then
-			lastMove = os.clock()
-			local start = root.Position
-			pcall(function()
+		local ok, err = pcall(function()
+			local character = Players.LocalPlayer.Character
+			local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+			local root = character and character:FindFirstChild("HumanoidRootPart")
+			if not (humanoid and root) or humanoid.Health <= 0 then
+				lastMove = os.clock() -- персонажа нет (респавн, между раундами) — ждём
+			elseif humanoid.MoveDirection.Magnitude > 0.1 then
+				lastMove = os.clock() -- игрок ходит сам — не мешаем
+			elseif os.clock() - lastMove >= ANTI_AFK_EVERY then
+				lastMove = os.clock()
+				local start = root.Position
 				humanoid:MoveTo(start + root.CFrame.LookVector * ANTI_AFK_STEP)
 				task.wait(0.7)
 				humanoid:MoveTo(start)
-			end)
-			print("[Ридер] анти-АФК: шаг туда-обратно")
+				print("[Ридер] анти-АФК: шаг туда-обратно")
+			end
+		end)
+		if not ok then
+			reportError("анти-АФК", err)
 		end
 	end
 end)
