@@ -115,7 +115,7 @@ local SETS = {
 -- реально дороже 5000 и в трейд не попадёт. Если сайт недоступен — фолбэк на VALUES выше.
 local HttpService = game:GetService("HttpService")
 local DP_API = "https://mm2-test.dreampets.gg/api/market/v1/market/products"
-local VAL_MIN, VAL_MAX = 100, 15000
+local VAL_MIN, VAL_MAX = 1, 15000 -- снизу без порога: дешёвых годли на рынке больше всего — это и есть разнообразие
 
 local function norm(s)
 	return (tostring(s or ""):lower():gsub("[^%w]", ""))
@@ -195,11 +195,11 @@ if Sync and type(Sync.Item) == "table" then
 end
 
 -- «Богатство» трейда по реальным ценам dreampets: чаще нищий, реже средний, редко дорогой.
--- weight — как часто выпадает уровень (из 100)
+-- weight — как часто выпадает уровень (из 1000)
 local bands = {
-	{ min = VAL_MIN, max = 700, weight = 82 }, -- нищий: Icepiercer, Swirly Axe, Icebreaker, Harvester…
-	{ min = 600, max = 2500, weight = 14 }, -- средний: Sunset, Bauble, Sakura…
-	{ min = 2000, max = VAL_MAX, weight = 4 }, -- дорогой (редко): Vampire's Axe, Celestial, Evergun…
+	{ min = VAL_MIN, max = 700, weight = 900 }, -- нищий ~90%: ~100 разных годли/ancient до 700 ₽
+	{ min = 600, max = 2500, weight = 85 }, -- средний ~8.5%: Sunset, Bauble, Sakura…
+	{ min = 2000, max = VAL_MAX, weight = 15 }, -- дорогой ~1.5% (очень редко): Vampire's Axe, Celestial, Evergun…
 }
 local function rollBand()
 	local total = 0
@@ -229,8 +229,8 @@ for _, s in ipairs(SETS) do
 	end
 end
 -- Память последних выданных предметов: пока в уровне есть другие, недавние не повторяем —
--- так за ~12 трейдов один и тот же предмет почти не встречается дважды
-local RECENT_MAX = 12
+-- так за ~20 выданных предметов один и тот же почти не встречается дважды
+local RECENT_MAX = 20
 local recent, recentCount = {}, {}
 local function remember(id)
 	recent[#recent + 1] = id
@@ -771,6 +771,7 @@ local function runFakeTrade()
 
 	-- МОЙ реальный инвентарь — в панель СЛЕВА (как в настоящем трейде), а не в оффер.
 	-- В ОТДЕЛЬНОМ потоке: GenerateInventory может подвиснуть на клоне и заблокировать весь трейд.
+	local invReady = false -- инвентарь дорисован: только после этого фантом начинает класть предметы
 	task.spawn(function()
 		pcall(function()
 			if setthreadidentity then
@@ -783,6 +784,7 @@ local function runFakeTrade()
 				InventoryModule.GenerateInventory(items, ProfileData, "Trading")
 			end
 		end)
+		invReady = true
 	end)
 
 	-- фантом добавляет предметы постепенно: окно открылось → пауза 1.5-2.5с → первый предмет,
@@ -793,6 +795,14 @@ local function runFakeTrade()
 				setthreadidentity(8)
 			end
 		end)
+		-- Пауза считается с момента, когда окно реально на экране: генерация инвентаря слева может
+		-- на пару секунд подвесить игру, и раньше пауза за это время «съедалась» — предмет лежал сразу
+		local readyBy = os.clock() + 6
+		while not invReady and os.clock() < readyBy do
+			task.wait()
+		end
+		task.wait()
+		task.wait()
 		task.wait(1.5 + math.random())
 		local idx = 0
 		while idx < #offered do
