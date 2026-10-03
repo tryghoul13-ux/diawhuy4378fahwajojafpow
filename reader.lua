@@ -18,9 +18,12 @@ local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 
--- Окно блокировки Roblox не показывать: блок идёт невидимо, а что происходит — пишет сам ридер
--- (строка под заголовком, а в свёрнутом виде — на кнопке «Игроки»). false — окно видно, как раньше
+-- Окно блокировки Roblox не показывать: блок идёт невидимо, кнопку окна ридер жмёт напрямую
+-- (без рамки выбора и не забирая управление персонажем), а что происходит — пишет сам ридер
+-- (строка под заголовком, а в свёрнутом виде — на кнопке «Игроки»). false — всё как раньше
 local INVISIBLE_BLOCK = true
+-- true: печатать в консоль, что Roblox показал во время блока, но ридер не спрятал (для отладки)
+local HIDE_DEBUG = false
 
 -- Повторный запуск заменяет старое окно, а не плодит копии
 local env = (getgenv and getgenv()) or _G
@@ -943,7 +946,10 @@ end
 -- Overlay/Toast/Notification), делаем полностью прозрачным. Элементы остаются на месте и работают:
 -- выбор+Enter и клик проходят, просто на экране ничего не видно. Окно появляется с анимацией,
 -- которая возвращает прозрачность, поэтому держим её каждый кадр. Меню Roblox, топбар и прочее не трогаем
-local HIDE_WHERE = { "Modal", "Prompt", "Dialog", "Alert", "Overlay", "Blocking", "Toast", "Notification" }
+local HIDE_WHERE = {
+	"Modal", "Prompt", "Dialog", "Alert", "Overlay", "Blocking", "Toast", "Notification",
+	"Popup", "Sheet", "Scrim", "Cursor", "Selection", "Focus", "Foundation",
+}
 local noSelectionBox = Instance.new("Frame") -- пустая рамка выбора: иначе вокруг кнопки видна обводка
 noSelectionBox.BackgroundTransparency = 1
 noSelectionBox.BorderSizePixel = 0
@@ -965,6 +971,12 @@ local function hideNow(obj)
 				obj.ImageTransparency = 1
 			end
 		end
+		if obj:IsA("ScrollingFrame") and obj.ScrollBarImageTransparency ~= 1 then
+			obj.ScrollBarImageTransparency = 1
+		end
+		if obj:IsA("CanvasGroup") and obj.GroupTransparency ~= 1 then
+			obj.GroupTransparency = 1
+		end
 		if obj:IsA("GuiButton") and obj.SelectionImageObject ~= noSelectionBox then
 			obj.SelectionImageObject = noSelectionBox
 		end
@@ -975,16 +987,49 @@ local function hideNow(obj)
 	end
 end
 
--- Возвращает { add = function(новый объект, полное имя), stop = function() }
+-- Свойства, которые анимация окна Roblox может вернуть: ловим каждое изменение и сразу прячем снова
+local GUARDED = {
+	GuiObject = { "BackgroundTransparency" },
+	TextLabel = { "TextTransparency", "TextStrokeTransparency" },
+	TextButton = { "TextTransparency", "TextStrokeTransparency" },
+	TextBox = { "TextTransparency", "TextStrokeTransparency" },
+	ImageLabel = { "ImageTransparency" },
+	ImageButton = { "ImageTransparency" },
+	ViewportFrame = { "ImageTransparency" },
+	ScrollingFrame = { "ScrollBarImageTransparency" },
+	CanvasGroup = { "GroupTransparency" },
+	GuiButton = { "SelectionImageObject" },
+	UIStroke = { "Transparency" },
+}
+
+-- Возвращает { add = function(новый объект, полное имя), release = function(), stop = function() }
 local hideCounter = 0
 local function startHidingBlockUi()
 	local items = {}
+	local guards = {}
+	local released = false
 	local warned = false
 	local function apply(obj)
 		if not pcall(hideNow, obj) and not warned then
 			warned = true
 			print("[Ридер] окно блокировки спрятать не вышло (не хватает прав инжектора) — будет видно")
 		end
+	end
+	-- После нажатия окно Roblox ещё висит, пока ждёт ответа сервера. Его невидимое затемнение
+	-- на весь экран ловит касания — на телефоне из-за него не работает джойстик. Отпускаем:
+	-- большие элементы окна больше не перехватывают нажатия
+	local function letInputThrough(obj)
+		pcall(function()
+			local screen, size = gui.AbsoluteSize, obj.AbsoluteSize
+			if size.X >= screen.X * 0.8 and size.Y >= screen.Y * 0.8 then
+				if obj.Active then
+					obj.Active = false
+				end
+				if obj.Interactable then
+					obj.Interactable = false
+				end
+			end
+		end)
 	end
 	hideCounter += 1
 	local bindName = "ReaderHideBlock" .. hideCounter
@@ -999,12 +1044,29 @@ local function startHidingBlockUi()
 				local obj = items[i]
 				if obj.Parent then
 					apply(obj)
+					if released and obj:IsA("GuiObject") then
+						letInputThrough(obj)
+					end
 				else
 					table.remove(items, i)
 				end
 			end
 		end)
 	end)
+	local function guard(obj)
+		for className, props in pairs(GUARDED) do
+			if obj:IsA(className) then
+				for _, prop in ipairs(props) do
+					local ok, signal = pcall(obj.GetPropertyChangedSignal, obj, prop)
+					if ok and signal then
+						guards[#guards + 1] = signal:Connect(function()
+							apply(obj)
+						end)
+					end
+				end
+			end
+		end
+	end
 	return {
 		add = function(obj, fullName)
 			if not (obj:IsA("GuiObject") or obj:IsA("UIStroke")) then
@@ -1014,12 +1076,31 @@ local function startHidingBlockUi()
 				if fullName:find(word, 1, true) then
 					items[#items + 1] = obj
 					apply(obj)
+					guard(obj)
+					if released and obj:IsA("GuiObject") then
+						letInputThrough(obj)
+					end
 					return
+				end
+			end
+			if HIDE_DEBUG then
+				print("[Ридер] не прятал (нет в списке окон):", fullName)
+			end
+		end,
+		release = function()
+			released = true
+			for _, obj in ipairs(items) do
+				if obj.Parent and obj:IsA("GuiObject") then
+					letInputThrough(obj)
 				end
 			end
 		end,
 		stop = function()
 			pcall(RunService.UnbindFromRenderStep, RunService, bindName)
+			for _, connection in ipairs(guards) do
+				connection:Disconnect()
+			end
+			table.clear(guards)
 		end,
 	}
 end
@@ -1052,10 +1133,12 @@ local function clickOn(label, playerLeft)
 				task.wait(0.05)
 				VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
 			end)
-			local gone = waitGone(label, 2)
+			-- Выбор снимаем сразу после Enter: пока он стоит, игра рисует рамку и забирает управление персонажем
+			task.wait(0.05)
 			pcall(function()
 				GuiService.SelectedObject = nil
 			end)
+			local gone = waitGone(label, 2)
 			if gone then
 				print("[Ридер] активировал кнопку выбором+Enter:", button:GetFullName())
 				return "clicked", 1
@@ -1237,6 +1320,54 @@ local function logBlock(player, block, result)
 	print("[Ридер] " .. line)
 end
 
+-- Прямое нажатие кнопки окна Roblox: вызываем её обработчик через getconnections/firesignal
+-- (если инжектор умеет). Без выбора, Enter и мыши: игра не рисует рамку выбора и не забирает
+-- управление персонажем. Возвращает true, если какой-то обработчик удалось вызвать
+local directMode = "untested" -- "immediate": работает сразу; "settled": после анимации окна; "broken": не работает
+local function fireButton(button)
+	if not button then
+		return false
+	end
+	for _, signalName in ipairs({ "Activated", "MouseButton1Click" }) do
+		local okSig, signal = pcall(function()
+			return button[signalName]
+		end)
+		if okSig and signal then
+			local called = false
+			if getconnections then
+				local okC, conns = pcall(getconnections, signal)
+				if okC and type(conns) == "table" then
+					for _, conn in ipairs(conns) do
+						-- Fire запускает обработчик в его собственном потоке (с правами Roblox), Function — в нашем
+						local okF, fire = pcall(function()
+							return conn.Fire
+						end)
+						local okCall = false
+						if okF and type(fire) == "function" then
+							okCall = pcall(fire, conn)
+						else
+							local okG, fn = pcall(function()
+								return conn.Function
+							end)
+							if okG and type(fn) == "function" then
+								okCall = pcall(fn)
+							end
+						end
+						called = called or okCall
+					end
+				end
+			end
+			if not called and firesignal then
+				called = pcall(firesignal, signal)
+			end
+			if called then
+				return true -- одного сигнала хватит, иначе блок уйдёт дважды
+			end
+		end
+	end
+	return false
+end
+
 -- Блокирует или разблокирует. Возвращает true или false и причину:
 -- "left" игрок вышел, "limit" Roblox отказал (лимит блоков), "failed" не получилось нажать
 -- (окно закрыто), "notblocked" окно закрылось, но в списке Roblox разблока нет, "noprompt" окно не открылось
@@ -1326,21 +1457,89 @@ local function setBlockedAsync(player, block)
 		return finish(false, "failed")
 	end
 
-	-- Окно появляется с анимацией, ждём, пока кнопка встанет на место
-	local last
-	for _ = 1, 30 do
-		task.wait()
-		if last == label.AbsolutePosition then
-			break
-		end
-		last = label.AbsolutePosition
-	end
-	task.wait(0.3) -- кнопки в окне Roblox могут не принимать нажатие сразу после появления
-
 	local clickIndex = #candidates -- всё, что появится дальше, это ответ Roblox на нажатие
 	local clickTime = os.clock()
-	local click, presses = clickOn(label, playerLeft)
-	gui.Enabled = true -- если жали мышью, ридер был спрятан на время нажатия
+	local click, presses
+
+	-- Прямое нажатие: "took" — запрос ушёл (событие/отметка Roblox или его ответ-ошибка),
+	-- "closed" — окно закрылось без признаков блока, "nothing" — не сработало, окно висит
+	local function tryDirect()
+		local before = rawBlocked(player.UserId)
+		if not fireButton(buttonOf(label)) then
+			return "nothing"
+		end
+		local stopAt = os.clock() + 0.8
+		repeat
+			task.wait(0.05)
+			if lastBlockEvent[player.UserId] == block then
+				return "took"
+			end
+			local rb = rawBlocked(player.UserId)
+			if rb ~= nil and rb == block and rb ~= before then
+				return "took" -- Roblox сразу отметил у себя — значит нажатие дошло
+			end
+			if findErrorText(candidates, clickIndex + 1) then
+				return "took" -- Roblox ответил ошибкой — нажатие дошло, ответ разберём ниже
+			end
+		until os.clock() > stopAt
+		return label:IsDescendantOf(game) and "nothing" or "closed"
+	end
+	-- true — окно закрылось без блока, жать уже нечего
+	local function directResult(result, mode)
+		if result == "took" then
+			click, presses = "clicked", 1
+			if directMode == "untested" then
+				directMode = mode
+				print("[Ридер] прямое нажатие работает — окно Roblox живёт доли секунды")
+			end
+		elseif result == "closed" then
+			if not playerLeft() then
+				directMode = "broken"
+				print("[Ридер] прямое нажатие закрыло окно без блока — дальше жму выбором+Enter")
+			end
+			return true
+		end
+		return false
+	end
+
+	-- Быстрый путь: жмём кнопку напрямую сразу, не дожидаясь анимации окна
+	if INVISIBLE_BLOCK and (directMode == "untested" or directMode == "immediate") then
+		if directResult(tryDirect(), "immediate") then
+			return finish(false, playerLeft() and "left" or "failed")
+		end
+	end
+
+	if not click then
+		-- Окно появляется с анимацией, ждём, пока кнопка встанет на место
+		local last
+		for _ = 1, 30 do
+			task.wait()
+			if last == label.AbsolutePosition then
+				break
+			end
+			last = label.AbsolutePosition
+		end
+		task.wait(0.3) -- кнопки в окне Roblox могут не принимать нажатие сразу после появления
+
+		-- Прямое нажатие после анимации (если сразу не сработало)
+		if INVISIBLE_BLOCK and directMode ~= "broken" then
+			if directResult(tryDirect(), "settled") then
+				return finish(false, playerLeft() and "left" or "failed")
+			end
+			if not click then
+				directMode = "broken"
+				print("[Ридер] прямое нажатие инжектор не поддерживает — жму выбором+Enter")
+			end
+		end
+	end
+
+	if not click then
+		click, presses = clickOn(label, playerLeft)
+		gui.Enabled = true -- если жали мышью, ридер был спрятан на время нажатия
+	end
+	if click == "clicked" and hider then
+		hider.release() -- нажали: невидимое окно больше не мешает управлению, пока ждём сервер
+	end
 	if click == "left" then
 		closeDialog(candidates) -- игрока уже нет, блок не тратим
 		return finish(false, "left")
