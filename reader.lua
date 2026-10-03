@@ -495,6 +495,27 @@ end
 -- Roblox (CorePackages) ломает меню Roblox до перезахода. Поэтому открываем
 -- обычное окно блокировки и сами жмём в нём кнопку. Блокирует сам Roblox, своими правами.
 local blockedIds = {}
+-- [userId] = true: мы разблокировали игрока (или Roblox сказал «нечего снимать»), а клиентский
+-- список GetBlockedUserIds может залипнуть и показывать его заблокированным. Держим «не заблокирован».
+-- СОХРАНЯЕМ В ФАЙЛ: при перезаходе в игру ридер перезапускается, и без файла пометка бы потерялась,
+-- из-за чего при повторном входе снова висела бы «Снять блок», а автоблок бы игрока пропускал.
+local serverUnblocked = {}
+local SU_FILE = "server_unblocked.txt"
+local function setServerUnblocked(userId, value)
+	serverUnblocked[userId] = value or nil
+	local ids = {}
+	for id in pairs(serverUnblocked) do
+		ids[#ids + 1] = tostring(id)
+	end
+	pcall(writefile, SU_FILE, table.concat(ids, ","))
+end
+pcall(function() -- восстанавливаем список при запуске
+	if isfile and isfile(SU_FILE) then
+		for id in readfile(SU_FILE):gmatch("%d+") do
+			serverUnblocked[tonumber(id)] = true
+		end
+	end
+end)
 local lastBlockEvent = {} -- [userId] = true/false: что последним сообщил Roblox (PlayerBlockedEvent)
 local blockInProgress = false
 
@@ -542,6 +563,9 @@ end
 
 local function markBlocked(player, isBlocked)
 	blockedIds[player.UserId] = isBlocked or nil
+	if isBlocked then
+		setServerUnblocked(player.UserId, false) -- реально заблокировали — фантом неактуален
+	end
 	local entry = rows[player]
 	if entry and entry.setBlocked then
 		entry.setBlocked(isBlocked)
@@ -558,12 +582,32 @@ local function refreshBlocked()
 	for _, id in ipairs(ids) do
 		blockedIds[id] = true
 	end
+	-- Залипшие фантомы: сервер их уже разблокировал, не верим клиентскому списку
+	for id in pairs(serverUnblocked) do
+		blockedIds[id] = nil
+	end
 	for player, entry in pairs(rows) do
 		if entry.setBlocked then
 			entry.setBlocked(blockedIds[player.UserId] == true)
 		end
 	end
 	return true
+end
+
+-- Сырой ответ списка Roblox по одному игроку, БЕЗ поправки на serverUnblocked.
+-- Нужен для подтверждения блока: иначе пометка «не заблокирован» мешала бы подтвердить новый блок.
+-- true — есть в списке, false — нет, nil — список не прочитался
+local function rawBlocked(userId)
+	local ok, ids = pcall(StarterGui.GetCore, StarterGui, "GetBlockedUserIds")
+	if not ok or type(ids) ~= "table" then
+		return nil
+	end
+	for _, id in ipairs(ids) do
+		if id == userId then
+			return true
+		end
+	end
+	return false
 end
 
 -- Кнопка «Заблокировать» / «Разблокировать» в окне Roblox. Точная подпись зависит
@@ -638,6 +682,37 @@ local function clickOn(label, playerLeft)
 	local button = buttonOf(label)
 	local center = label.AbsolutePosition + label.AbsoluteSize / 2
 	local inset = GuiService:GetGuiInset()
+
+	-- Новое окно блокировки Roblox (FoundationOverlay) НЕ реагирует на клик мышью по координатам:
+	-- его кнопка активируется выбором (GuiService.SelectedObject) и клавишей Enter.
+	-- Пробуем это первым — так же надёжно жмётся и старое окно Roblox.
+	if button then
+		local okSel = pcall(function()
+			GuiService.SelectedObject = button
+		end)
+		task.wait(0.1)
+		local selected = okSel and GuiService.SelectedObject == button
+		if selected then
+			pcall(function()
+				VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Return, false, game)
+				task.wait(0.05)
+				VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
+			end)
+			local gone = waitGone(label, 2)
+			pcall(function()
+				GuiService.SelectedObject = nil
+			end)
+			if gone then
+				print("[Ридер] активировал кнопку выбором+Enter:", button:GetFullName())
+				return "clicked", 1
+			end
+		else
+			pcall(function()
+				GuiService.SelectedObject = nil
+			end)
+		end
+	end
+
 	-- На MEmu срабатывает центр + отступ верхней панели, его пробуем первым
 	local points = { center + inset, center, center - inset }
 	if workingOffset then
@@ -827,8 +902,15 @@ local function setBlockedAsync(player, block)
 	local function finish(success, reason)
 		watcher:Disconnect()
 		gui.Enabled = true
-		if success and block then
-			table.insert(recentBlocks, os.time())
+		if success then
+			if block then
+				table.insert(recentBlocks, os.time())
+				setServerUnblocked(player.UserId, false) -- заблокировали — пометка «не заблокирован» снята
+			else
+				-- Разблокировали — держим «не заблокирован» и после перезахода, чтобы залипший
+				-- список Roblox не вернул кнопку в «Снять блок», а автоблок взял игрока снова
+				setServerUnblocked(player.UserId, true)
+			end
 		end
 		logBlock(player, block, success and "ok" or reason)
 		return success, reason
@@ -914,6 +996,21 @@ local function setBlockedAsync(player, block)
 	until outcome or os.clock() > deadline
 
 	if outcome == "error" then
+		closeDialog(candidates)
+		if not block then
+			-- Разблокировка «Error Unblocking User» = на сервере блока нет (его нечего снимать).
+			-- Клиентский список мог залипнуть (фантом). Верим серверу: он НЕ заблокирован.
+			-- Помечаем как фантом, чтобы залипший список больше не возвращал кнопку в «Снять блок».
+			setServerUnblocked(player.UserId, true)
+			markBlocked(player, false)
+			print("[Ридер] сервер: блока нет, снимаю залипшую отметку:", player.Name)
+			return finish(true)
+		end
+		-- Блок: ошибка — но вдруг он уже в списке. Иначе это отказ (лимит)
+		task.wait(1)
+		if rawBlocked(player.UserId) == true then
+			return finish(true)
+		end
 		return finish(false, "limit")
 	elseif not outcome then
 		print("[Ридер] сервер не ответил за 15 с")
@@ -933,24 +1030,27 @@ local function setBlockedAsync(player, block)
 			task.wait(rest)
 		end
 	end
-	task.wait(2.5) -- пауза на ответ сервера и откат оптимистичной отметки
+	task.wait(1.2) -- пауза на ответ сервера и откат оптимистичной отметки (сервер отвечает ~0.2 с)
+	-- Проверяем по СЫРОМУ списку Roblox (rawBlocked), а не по blockedIds: во время блока пометка
+	-- serverUnblocked ещё стоит и обнулила бы blockedIds, не дав подтвердить новый блок
 	local confirmed = 0
-	for _ = 1, 4 do
-		if refreshBlocked() then
-			if (blockedIds[player.UserId] == true) == block then
+	for _ = 1, 5 do
+		local rb = rawBlocked(player.UserId)
+		if rb ~= nil then
+			if rb == block then
 				confirmed += 1
 				if confirmed >= 2 then
-					return finish(true) -- список подтвердил результат устойчиво
+					local okR, reasonR = finish(true) -- для блока снимает пометку serverUnblocked
+					refreshBlocked() -- теперь кнопки с учётом актуальной пометки
+					return okR, reasonR
 				end
 			else
-				-- отметка откатилась (или её и не было): настоящего блока нет
-				print("[Ридер] список Roblox не подтвердил блок (откат оптимистичной отметки):", player.Name)
+				print("[Ридер] список Roblox не подтвердил результат:", player.Name)
 				return finish(false, block and "notblocked" or "stillblocked")
 			end
 		end
-		task.wait(1.2)
+		task.wait(0.5)
 	end
-	-- за всё время список ни разу не дал стабильного подтверждения
 	print("[Ридер] не удалось подтвердить блок по списку Roblox:", player.Name)
 	return finish(false, block and "notblocked" or "stillblocked")
 end
@@ -1018,12 +1118,29 @@ local function runBlock(player, block)
 	if entry and entry.showStatus then
 		entry.showStatus("...")
 	end
+	if not block then
+		-- Разблокировка: намерение «он НЕ заблокирован» фиксируем СРАЗУ и в файл, ещё до запроса.
+		-- Даже если запрос к Roblox упадёт (пустое окно/фантом) — при перезаходе не будет висеть
+		-- «Снять блок», а автоблок возьмёт игрока снова
+		setServerUnblocked(player.UserId, true)
+		markBlocked(player, false)
+	end
 	local called, ok, reason = pcall(setBlockedAsync, player, block)
 	blockInProgress = false
 	if not called then
 		print("[Ридер] ошибка в блоке:", ok)
 		gui.Enabled = true
 		ok, reason = false, "failed"
+	end
+
+	-- Разблокировку НЕ повторяем: локально уже снято и записано в файл, что бы сервер ни ответил
+	if not block then
+		queue[player] = nil
+		updateTitle()
+		if entry and entry.showStatus then
+			entry.showStatus("✓ Снято", 1.5)
+		end
+		return
 	end
 
 	if ok then
@@ -1362,14 +1479,6 @@ local function addRow(player)
 	local entry = { frame = row, high = false, low = false, blocked = false, addedAt = os.clock() }
 	rows[player] = entry
 
-	-- Видно, почему авто-блок пропустил игрока: друзей он не трогает (блок удалил бы из друзей)
-	function entry.setFriend(isFriendNow)
-		if entry.friend ~= isFriendNow then
-			entry.friend = isFriendNow
-			nameLabel.Text = isFriendNow and (name .. '  <font color="#7FD6FF">👥 друг — не блокирую</font>') or name
-		end
-	end
-
 	-- Себя заблокировать нельзя, у своей строки кнопки нет
 	if not isMe then
 		local blockButton = new("TextButton", {
@@ -1535,8 +1644,16 @@ local function removeRow(player)
 	if entry then
 		entry.frame:Destroy()
 		rows[player] = nil
-		updateTitle()
 	end
+	-- Вышел с сервера — забываем ручные решения по нему. Если он зайдёт снова,
+	-- авто-блок оценит его заново и заблокирует, а не будет помнить старую разблокировку
+	queue[player] = nil
+	-- Забываем РУЧНОЕ решение «не блокировать» — чтобы при повторном входе автоблок сработал снова
+	autoSkip[player.UserId] = nil
+	friendCache[player.UserId] = nil -- дружбу тоже перепроверим при повторном входе
+	-- serverUnblocked НЕ сбрасываем: если сервер сказал «блока нет», это верно и после перезахода,
+	-- иначе залипший список Roblox снова пометил бы его заблокированным и автоблок бы его пропустил
+	updateTitle()
 end
 
 for _, player in ipairs(Players:GetPlayers()) do
@@ -1559,31 +1676,21 @@ local function hasNoHigh(entry)
 	if entry.invItems ~= nil then
 		return #entry.invItems == 0 -- рюкзак проверен: годли+ в нём нет
 	end
-	-- рюкзак ещё не загрузился: ждём до 18 с, потом всё равно блокуем (по надетому)
-	return (os.clock() - entry.addedAt) > 18
+	-- рюкзак ещё не загрузился: ждём до 10 с, потом всё равно блокуем (по надетому)
+	return (os.clock() - entry.addedAt) > 10
 end
 
 local function queueAutoBlocks()
-	local targets = {}
+	-- Блокируем всех, у кого и нож, и пистолет ниже годли — в том числе друзей
+	-- (блок удалит из друзей, это ожидаемо). nextTry с запасом: если за это время игрок
+	-- окажется годли+ (докрутился атрибут или подгрузился рюкзак), следующий тик очереди
+	-- снимет его из очереди до блока
 	for player, entry in pairs(rows) do
-		if entry.low and hasNoHigh(entry) and not entry.blocked and not queue[player]
+		if autoBlock and entry.low and hasNoHigh(entry) and not entry.blocked and not queue[player]
 			and not autoSkip[player.UserId] and player ~= Players.LocalPlayer
-			and os.clock() - entry.addedAt > 10
+			and os.clock() - entry.addedAt > 4 -- даём данным MM2 чуть прогрузиться
 		then
-			targets[#targets + 1] = player
-		end
-	end
-	-- Проверка дружбы ходит на сервер, поэтому после неё смотрим условия ещё раз
-	for _, player in ipairs(targets) do
-		local entry = rows[player]
-		local friend = isFriend(player)
-		if entry and entry.setFriend then
-			entry.setFriend(friend)
-		end
-		if not friend and autoBlock and entry and entry.low and hasNoHigh(entry) and not queue[player] then
-			-- nextTry с запасом: если за это время игрок окажется годли+ (докрутился атрибут
-			-- или подгрузился рюкзак), следующий тик очереди снимет его из очереди до блока
-			queue[player] = { block = true, nextTry = os.clock() + 3, auto = true }
+			queue[player] = { block = true, nextTry = os.clock() + 1, auto = true }
 			updateTitle()
 		end
 	end
@@ -1592,8 +1699,16 @@ end
 -- Очередь: раз в секунду обновляет отсчёт на кнопках и сама запускает тех, чьё время пришло
 local alive = true
 task.spawn(function()
+	local tick = 0
 	while alive do
 		task.wait(1)
+		tick += 1
+		-- Раз в ~6 с сверяем кнопки с реальным списком Roblox: если игрок на самом деле
+		-- НЕ заблокирован, а кнопка висит «Снять блок», она сама вернётся в «🚫 Блок».
+		-- Во время самого блока не трогаем, чтобы не мешать его проверке
+		if tick % 6 == 0 and not blockInProgress and not testRunning then
+			pcall(refreshBlocked)
+		end
 		for player, item in pairs(queue) do
 			-- Вышел с сервера, уже в нужном состоянии (например, блокнули через меню Roblox)
 			-- или, если блок авто, у него обнаружился годли+ (надел или нашёлся в рюкзаке)
