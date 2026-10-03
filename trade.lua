@@ -115,7 +115,7 @@ local SETS = {
 -- реально дороже 5000 и в трейд не попадёт. Если сайт недоступен — фолбэк на VALUES выше.
 local HttpService = game:GetService("HttpService")
 local DP_API = "https://mm2-test.dreampets.gg/api/market/v1/market/products"
-local VAL_MIN, VAL_MAX = 1, 15000 -- снизу без порога: дешёвых годли на рынке больше всего — это и есть разнообразие
+local VAL_MIN, VAL_MAX = 50, 15000 -- снизу 50 ₽: самый бичевский мусор не кидаем, но разнообразие остаётся
 
 local function norm(s)
 	return (tostring(s or ""):lower():gsub("[^%w]", ""))
@@ -174,7 +174,7 @@ local function isColorVariant(id)
 	return false
 end
 
--- пул: godly/ancient/unique нож-пистолет (не хрома, не цветной вариант), с ценой в [VAL_MIN,VAL_MAX]
+-- пул: godly/ancient нож-пистолет (не unique, не хрома, не цветной вариант), с ценой в [VAL_MIN,VAL_MAX]
 local pool, poolSet, priceById = {}, {}, {}
 if Sync and type(Sync.Item) == "table" then
 	for id, e in pairs(Sync.Item) do
@@ -182,7 +182,7 @@ if Sync and type(Sync.Item) == "table" then
 		if type(e) == "table" and (e.ItemType == "Knife" or e.ItemType == "Gun")
 			and not sid:find("^Default") and not isColorVariant(sid) and e.Image ~= nil and e.Chroma ~= true then
 			local rar = tostring(e.Rarity or ""):lower()
-			if rar == "godly" or rar == "ancient" or rar == "unique" then
+			if rar == "godly" or rar == "ancient" then
 				local p = priceForItem(id, e)
 				if p and p >= VAL_MIN and p <= VAL_MAX then
 					pool[#pool + 1] = id
@@ -195,11 +195,11 @@ if Sync and type(Sync.Item) == "table" then
 end
 
 -- «Богатство» трейда по реальным ценам dreampets: чаще нищий, реже средний, редко дорогой.
--- weight — как часто выпадает уровень (из 1000)
+-- weight — как часто выпадает уровень (из 100)
 local bands = {
-	{ min = VAL_MIN, max = 700, weight = 900 }, -- нищий ~90%: ~100 разных годли/ancient до 700 ₽
-	{ min = 600, max = 2500, weight = 85 }, -- средний ~8.5%: Sunset, Bauble, Sakura…
-	{ min = 2000, max = VAL_MAX, weight = 15 }, -- дорогой ~1.5% (очень редко): Vampire's Axe, Celestial, Evergun…
+	{ min = VAL_MIN, max = 400, weight = 62 }, -- нищий 62%: Swirly Axe, Elderwood Scythe, Icebreaker, Watergun…
+	{ min = 400, max = 2500, weight = 30 }, -- крутой 30%: Icepiercer, Harvester, Sunset, Bauble, Sakura…
+	{ min = 2500, max = VAL_MAX, weight = 8 }, -- дорогой 8%: Vampire's Axe, Celestial, Evergun, Traveler's Gun…
 }
 local function rollBand()
 	local total = 0
