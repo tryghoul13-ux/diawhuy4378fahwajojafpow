@@ -115,7 +115,7 @@ local SETS = {
 -- реально дороже 5000 и в трейд не попадёт. Если сайт недоступен — фолбэк на VALUES выше.
 local HttpService = game:GetService("HttpService")
 local DP_API = "https://mm2-test.dreampets.gg/api/market/v1/market/products"
-local VAL_MIN, VAL_MAX = 500, 15000
+local VAL_MIN, VAL_MAX = 100, 15000
 
 local function norm(s)
 	return (tostring(s or ""):lower():gsub("[^%w]", ""))
@@ -194,8 +194,27 @@ if Sync and type(Sync.Item) == "table" then
 	end
 end
 
--- бенды «богатства»: то поскромнее, то средний, то дорогой — для разнообразия
-local bands = { { VAL_MIN, 2500 }, { 2000, 7000 }, { 6000, VAL_MAX } }
+-- «Богатство» трейда по реальным ценам dreampets: чаще нищий, реже средний, редко дорогой.
+-- weight — как часто выпадает уровень (из 100)
+local bands = {
+	{ min = VAL_MIN, max = 700, weight = 82 }, -- нищий: Icepiercer, Swirly Axe, Icebreaker, Harvester…
+	{ min = 600, max = 2500, weight = 14 }, -- средний: Sunset, Bauble, Sakura…
+	{ min = 2000, max = VAL_MAX, weight = 4 }, -- дорогой (редко): Vampire's Axe, Celestial, Evergun…
+}
+local function rollBand()
+	local total = 0
+	for _, b in ipairs(bands) do
+		total += b.weight
+	end
+	local r = math.random() * total
+	for _, b in ipairs(bands) do
+		r -= b.weight
+		if r <= 0 then
+			return b
+		end
+	end
+	return bands[1]
+end
 -- валидные сеты (хотя бы 2 предмета набора попали в пул по цене)
 local setCands = {}
 for _, s in ipairs(SETS) do
@@ -209,20 +228,53 @@ for _, s in ipairs(SETS) do
 		setCands[#setCands + 1] = valid
 	end
 end
-local function pickInBand(band)
-	local cands = {}
-	for _, id in ipairs(pool) do
-		local v = priceById[id]
-		if v and v >= band[1] and v <= band[2] then
-			cands[#cands + 1] = id
+-- Память последних выданных предметов: пока в уровне есть другие, недавние не повторяем —
+-- так за ~12 трейдов один и тот же предмет почти не встречается дважды
+local RECENT_MAX = 12
+local recent, recentCount = {}, {}
+local function remember(id)
+	recent[#recent + 1] = id
+	recentCount[id] = (recentCount[id] or 0) + 1
+	while #recent > RECENT_MAX do
+		local old = table.remove(recent, 1)
+		recentCount[old] -= 1
+		if recentCount[old] <= 0 then
+			recentCount[old] = nil
 		end
 	end
-	return (#cands > 0) and pick(cands) or (#pool > 0 and pick(pool) or nil)
 end
--- что положит фантом: иногда сет (2-3 темы), иначе 1-3 РАЗНЫХ предмета в случайном бенде (без стака).
--- Анти-повтор: не кидаем те же предметы/сет, что в прошлом трейде подряд.
-local prevOffered, prevSet = {}, nil
+-- предмет уровня: сначала из тех, что давно не выпадали; exclude — уже лежат в этом трейде
+local function pickInBand(band, exclude)
+	local fresh, any = {}, {}
+	for _, id in ipairs(pool) do
+		local v = priceById[id]
+		if v and v >= band.min and v <= band.max and not exclude[id] then
+			any[#any + 1] = id
+			if not recentCount[id] then
+				fresh[#fresh + 1] = id
+			end
+		end
+	end
+	if #fresh > 0 then
+		return pick(fresh)
+	end
+	return (#any > 0) and pick(any) or nil
+end
+-- Сколько предметов кладёт фантом: в основном один
+local function rollCount()
+	local r = math.random(1, 100)
+	if r <= 72 then
+		return 1
+	elseif r <= 93 then
+		return 2
+	end
+	return 3
+end
+-- что положит фантом: сначала выпадает уровень богатства, потом изредка сет ЭТОГО уровня
+-- (все предметы сета не дороже потолка уровня), иначе 1-3 РАЗНЫХ предмета уровня (чаще один)
+local prevSet = nil
 local function buildTrade()
+	local band = rollBand()
 	local chosen, used = {}, {}
 	local function addId(id)
 		if id and not used[id] then
@@ -230,37 +282,38 @@ local function buildTrade()
 			chosen[#chosen + 1] = id
 		end
 	end
-	if #setCands > 0 and math.random() < 0.45 then
-		local s = pick(setCands)
-		for _ = 1, 6 do -- не тот же сет, что в прошлый раз
-			if s ~= prevSet or #setCands < 2 then
+	local fitting = {}
+	for _, s in ipairs(setCands) do
+		local fits = s ~= prevSet -- не тот же сет, что в прошлый раз
+		for _, id in ipairs(s) do
+			if (priceById[id] or math.huge) > band.max then
+				fits = false
 				break
 			end
-			s = pick(setCands)
 		end
+		if fits then
+			fitting[#fitting + 1] = s
+		end
+	end
+	if #fitting > 0 and math.random() < 0.12 then
+		local s = pick(fitting)
 		prevSet = s
-		local n = math.min(#s, math.random(2, 3))
+		-- сет обычно парой; тройкой — изредка, если в нём три предмета
+		local n = (#s >= 3 and math.random() < 0.25) and 3 or 2
 		for i = 1, n do
 			addId(s[i])
 		end
 	else
 		prevSet = nil
-		local total = math.random(1, 3)
-		local band = pick(bands)
-		local tries = 0
-		while #chosen < total and tries < 50 do
-			tries += 1
-			local id = pickInBand(band)
-			-- пропускаем предметы из прошлого трейда, пока есть запас попыток
-			if id and not used[id] and not (prevOffered[id] and tries < 35) then
-				addId(id)
-			end
+		for _ = 1, rollCount() do
+			addId(pickInBand(band, used))
 		end
 	end
-	-- запоминаем набор для следующего трейда (чтобы не повторить подряд)
-	prevOffered = {}
+	if #chosen == 0 and #pool > 0 then
+		addId(pick(pool)) -- уровень оказался пустым — кладём хоть что-то
+	end
 	for _, id in ipairs(chosen) do
-		prevOffered[id] = true
+		remember(id)
 	end
 	return chosen
 end
@@ -396,7 +449,15 @@ env.FakeOwned = env.FakeOwned or {} -- { itemId = сколько фейковы�
 env.FakeExpected = env.FakeExpected or {} -- { itemId = сколько должно быть в профиле с фейками }
 local fakeOwned, expected = env.FakeOwned, env.FakeExpected
 
+-- лог продолжается между перезапусками (иначе повторный запуск затирает строки прошлого трейда)
 local logBuf = {}
+pcall(function()
+	for line in tostring(readfile("trade_log.txt")):gmatch("[^\n]+") do
+		logBuf[#logBuf + 1] = line
+	end
+end)
+logBuf[#logBuf + 1] = "---- запуск ----"
+local logDirty = false
 local function tlog(s)
 	s = tostring(s)
 	print("[ФейкТрейд] " .. s)
@@ -404,8 +465,21 @@ local function tlog(s)
 	if #logBuf > 200 then
 		table.remove(logBuf, 1)
 	end
+	logDirty = true
 	pcall(writefile, "trade_log.txt", table.concat(logBuf, "\n"))
 end
+-- из потоков кликов writefile может молча не работать — дописываем лог из своего потока (как reader)
+env.FakeTradeRun = (env.FakeTradeRun or 0) + 1
+local myRun = env.FakeTradeRun
+task.spawn(function()
+	while env.FakeTradeRun == myRun do
+		task.wait(0.5)
+		if logDirty then
+			logDirty = false
+			pcall(writefile, "trade_log.txt", table.concat(logBuf, "\n"))
+		end
+	end
+end)
 
 local function profileOk()
 	return type(ProfileData) == "table" and type(ProfileData.Weapons) == "table"
@@ -536,12 +610,15 @@ local function addToInventory(list)
 		return
 	end
 	applying = true
+	local res = {}
 	for _, id in ipairs(list) do
 		fakeOwned[id] = (fakeOwned[id] or 0) + 1
 		addOne(id, ownedCount(id) + 1)
 		expected[id] = ownedCount(id)
+		res[#res + 1] = id .. "=" .. expected[id]
 	end
 	applying = false
+	tlog("инвентарь: в профиле теперь " .. table.concat(res, ", "))
 end
 
 -- если сервер пришлёт свежий профиль (крафт/покупка и т.п.), фейки из локальной копии пропадут —
@@ -553,6 +630,11 @@ local function reapply()
 	end
 	reapplyQueued = true
 	task.delay(0.5, function()
+		pcall(function()
+			if setthreadidentity then
+				setthreadidentity(8)
+			end
+		end)
 		reapplyQueued = false
 		if applying or not profileOk() then
 			return
@@ -762,6 +844,12 @@ local function runFakeTrade()
 		task.wait(0.45)
 		finish()
 		task.spawn(function()
+			pcall(function()
+				if setthreadidentity then
+					setthreadidentity(8)
+				end
+			end)
+			tlog("трейд завершён, добавляю в инвентарь: " .. table.concat(offered, ", "))
 			addToInventory(offered) -- в локальную копию профиля → игра перерисует инвентарь
 			if ItemPopupService and ItemPopupService.ItemReceived then
 				for _, id in ipairs(offered) do
