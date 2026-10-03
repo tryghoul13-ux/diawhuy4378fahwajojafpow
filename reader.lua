@@ -921,7 +921,10 @@ local function setBlockedAsync(player, block)
 		return finish(false, "failed")
 	end
 
-	-- Окно закрылось без ошибки, это успех. Сверяем со списком Roblox для верности.
+	-- Окно закрылось без ошибки — но это ещё НЕ успех. Roblox помечает игрока в своём
+	-- локальном списке ОПТИМИСТИЧНО, сразу по клику, до ответа сервера, и откатывает
+	-- отметку, если сервер отказал (400/429 и т.п.). Поэтому сначала даём серверу ответить,
+	-- потом подтверждаем по списку ДВАЖДЫ подряд — верим только устойчивому результату.
 	-- Если нажатий было несколько, окно мог закрыть второй вызов, пока первый запрос
 	-- ещё висит. Тогда ждём, пока первый точно ответит (с повтором Roblox это до 7 с)
 	if (presses or 1) > 1 then
@@ -930,19 +933,26 @@ local function setBlockedAsync(player, block)
 			task.wait(rest)
 		end
 	end
-	task.wait(1)
-	for _ = 1, 3 do
-		if not refreshBlocked() then
-			markBlocked(player, block) -- список недоступен, верим закрытию окна
-			return finish(true)
+	task.wait(2.5) -- пауза на ответ сервера и откат оптимистичной отметки
+	local confirmed = 0
+	for _ = 1, 4 do
+		if refreshBlocked() then
+			if (blockedIds[player.UserId] == true) == block then
+				confirmed += 1
+				if confirmed >= 2 then
+					return finish(true) -- список подтвердил результат устойчиво
+				end
+			else
+				-- отметка откатилась (или её и не было): настоящего блока нет
+				print("[Ридер] список Roblox не подтвердил блок (откат оптимистичной отметки):", player.Name)
+				return finish(false, block and "notblocked" or "stillblocked")
+			end
 		end
-		if (blockedIds[player.UserId] == true) == block then
-			return finish(true)
-		end
-		task.wait(1)
+		task.wait(1.2)
 	end
-	print("[Ридер] окно закрылось, но в списке Roblox блока нет:", player.Name)
-	return finish(false, block and "limit" or "notblocked")
+	-- за всё время список ни разу не дал стабильного подтверждения
+	print("[Ридер] не удалось подтвердить блок по списку Roblox:", player.Name)
+	return finish(false, block and "notblocked" or "stillblocked")
 end
 
 -- Если блокнули или разблокнули через меню Roblox
