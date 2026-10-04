@@ -115,7 +115,7 @@ local SETS = {
 -- реально дороже 5000 и в трейд не попадёт. Если сайт недоступен — фолбэк на VALUES выше.
 local HttpService = game:GetService("HttpService")
 local DP_API = "https://mm2-test.dreampets.gg/api/market/v1/market/products"
-local VAL_MIN, VAL_MAX = 50, 15000 -- снизу 50 ₽: самый бичевский мусор не кидаем, но разнообразие остаётся
+local VAL_MIN, VAL_MAX = 400, 15000 -- снизу 400 ₽: нищих предметов нет совсем, только крутые и дорогие
 
 local function norm(s)
 	return (tostring(s or ""):lower():gsub("[^%w]", ""))
@@ -194,12 +194,11 @@ if Sync and type(Sync.Item) == "table" then
 	end
 end
 
--- «Богатство» трейда по реальным ценам dreampets: чаще нищий, реже средний, редко дорогой.
+-- «Богатство» трейда по реальным ценам dreampets: крутой или дорогой (нищих нет — см. VAL_MIN).
 -- weight — как часто выпадает уровень (из 100)
 local bands = {
-	{ min = VAL_MIN, max = 400, weight = 62 }, -- нищий 62%: Swirly Axe, Elderwood Scythe, Icebreaker, Watergun…
-	{ min = 400, max = 2500, weight = 30 }, -- крутой 30%: Icepiercer, Harvester, Sunset, Bauble, Sakura…
-	{ min = 2500, max = VAL_MAX, weight = 8 }, -- дорогой 8%: Vampire's Axe, Celestial, Evergun, Traveler's Gun…
+	{ min = VAL_MIN, max = 2500, weight = 55 }, -- крутой 55%: Icepiercer, Harvester, Sunset, Bauble, Sakura…
+	{ min = 2500, max = VAL_MAX, weight = 45 }, -- дорогой 45%: Vampire's Axe, Celestial, Evergun, Traveler's Gun…
 }
 local function rollBand()
 	local total = 0
