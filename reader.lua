@@ -1198,6 +1198,21 @@ local function startHidingBlockUi()
 	}
 end
 
+-- Закрывает ли окно ридера (или свёрнутая кнопка) точку экрана. Ридер с IgnoreGuiInset,
+-- поэтому его координаты — от самого верха экрана, как и у нажатий VirtualInputManager
+local function readerCovers(point)
+	for _, obj in ipairs({ panel, openButton }) do
+		local shown = obj.Visible and (obj ~= panel or overlay.Visible)
+		if shown then
+			local pos, size = obj.AbsolutePosition, obj.AbsoluteSize
+			if point.X >= pos.X and point.X <= pos.X + size.X and point.Y >= pos.Y and point.Y <= pos.Y + size.Y then
+				return true
+			end
+		end
+	end
+	return false
+end
+
 -- Точное место нажатия неизвестно: с отступом верхней панели или без него.
 -- Водим мышь по вариантам и смотрим, когда кнопка подсветится (GuiState = Hover).
 -- Возвращает "clicked" (окно закрылось), "left" (игрок вышел, не жали) или "missed"
@@ -1227,12 +1242,13 @@ local function clickOn(label, playerLeft)
 				task.wait(0.05)
 				VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Return, false, game)
 			end)
-			-- Выбор снимаем сразу после Enter: пока он стоит, игра рисует рамку и забирает управление персонажем
-			task.wait(0.05)
+			-- Выбор держим, пока окно не закроется: если снять его сразу после Enter, Roblox не успевает
+			-- принять нажатие и блок срывается. Рамки выбора не видно (noSelectionBox), окно закрывается
+			-- за доли секунды — тогда выбор и снимаем
+			local gone = waitGone(label, 2)
 			pcall(function()
 				GuiService.SelectedObject = nil
 			end)
-			local gone = waitGone(label, 2)
 			if gone then
 				print("[Ридер] активировал кнопку выбором+Enter:", button:GetFullName())
 				return "clicked", 1
@@ -1244,15 +1260,21 @@ local function clickOn(label, playerLeft)
 		end
 	end
 
-	-- Дальше жмём мышью по координатам: ридер на это время прячем, чтобы клик не попал в его окно
-	-- (окно ридера не затемняет экран и может стоять где угодно). Обратно включается после нажатия
+	-- Дальше жмём мышью по координатам
 	setStage("mouse")
-	gui.Enabled = false
 
 	-- На MEmu срабатывает центр + отступ верхней панели, его пробуем первым
 	local points = { center + inset, center, center - inset }
 	if workingOffset then
 		table.insert(points, 1, center + workingOffset)
+	end
+	-- Ридер прячем, только если он закрывает точку нажатия (иначе клик достанется ему).
+	-- Не закрывает — не трогаем, окно не мигает. Обратно включается после нажатия
+	for _, point in ipairs(points) do
+		if readerCovers(point) then
+			gui.Enabled = false
+			break
+		end
 	end
 	local log = {}
 
@@ -1384,9 +1406,11 @@ local function closeDialog(candidates)
 			break
 		end
 	end
-	gui.Enabled = false -- клик по краю экрана не должен попасть в окно ридера (вернётся в finish)
 	local screen = workspace.CurrentCamera.ViewportSize
 	local point = Vector2.new(8, screen.Y / 2) + GuiService:GetGuiInset()
+	if readerCovers(point) then
+		gui.Enabled = false -- клик по краю экрана не должен попасть в окно ридера (вернётся после блока)
+	end
 	pcall(function()
 		VirtualInputManager:SendMouseButtonEvent(point.X, point.Y, 0, true, game, 1)
 		task.wait(0.05)
@@ -1429,9 +1453,10 @@ end
 
 -- Прямое нажатие кнопки окна Roblox: вызываем её обработчик через getconnections (если инжектор
 -- умеет). Без выбора, Enter и мыши: игра не рисует рамку выбора и не забирает управление персонажем.
--- Вызываем ТОЛЬКО обычные Lua-обработчики. Встроенные (C) и из чужого состояния Lua не трогаем:
--- их вызов через инжектор может уронить Roblox целиком. firesignal не используем по той же
--- причине. Возвращает true, если какой-то обработчик удалось вызвать
+-- Встроенные обработчики движка (C) не трогаем: их вызов через инжектор может уронить Roblox целиком.
+-- Lua-обработчик окна Roblox инжектор может не показывать (Function = nil) — его запускаем через Fire.
+-- firesignal не используем: он дёргает все обработчики подряд, включая встроенные.
+-- Возвращает true, если какой-то обработчик удалось вызвать
 -- "immediate": работает сразу; "settled": после анимации окна; "broken": не работает или выключено
 -- после вылета (uiSaved.noDirect)
 local directMode = uiSaved.noDirect and "broken" or "untested"
@@ -1461,16 +1486,17 @@ local function fireButton(button)
 		if okC and type(conns) == "table" then
 			local called = false
 			for _, conn in ipairs(conns) do
-				local okInfo, fn, foreign, isLua, fire = pcall(function()
-					return conn.Function, conn.ForeignState, conn.LuaConnection, conn.Fire
+				local okInfo, isLua, fn, fire = pcall(function()
+					return conn.LuaConnection, conn.Function, conn.Fire
 				end)
-				-- Только точно Lua-обработчик из нашего состояния: его функция нам видна и это не C
-				if okInfo and foreign ~= true and isLua ~= false and isLuaFunction(fn) then
+				-- Встроенный (C) обработчик пропускаем: инжектор так его и пометил или функция видна и она C
+				local native = isLua == false or (fn ~= nil and not isLuaFunction(fn))
+				if okInfo and not native then
 					-- Fire запускает обработчик с правами Roblox (в его потоке), Function — в нашем
 					local okCall = false
 					if type(fire) == "function" then
 						okCall = pcall(fire, conn)
-					else
+					elseif isLuaFunction(fn) then
 						okCall = pcall(fn)
 					end
 					called = called or okCall
