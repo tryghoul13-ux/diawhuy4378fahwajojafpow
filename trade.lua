@@ -1,6 +1,6 @@
 -- faketrade.lua — ТЕСТ: косметический трейд с фантомом. ТОЛЬКО картинка на твоём экране.
 -- Кнопка «Трейд (тест)»: окно трейда MM2 (клон) → фантом постепенно кладёт 2-4 предмета (по 1-2,
--- с паузами) → кулдаун 6с (принять нельзя) → фантом принимает → ТЫ сам жмёшь Accept/Confirm →
+-- с паузами) → кулдаун 6с (принять нельзя) → ТЫ жмёшь Accept/Confirm → фантом принимает через 1-2 с →
 -- родная презентация «You Got…» по центру и улёт в инвентарь (по каждому предмету).
 -- Предметы появляются в инвентаре ТОЛЬКО в локальной копии профиля на клиенте: сервер о них не знает,
 -- после перезахода пропадут. Никаких реальных ников, предметов по факту нет. Реквизит.
@@ -670,6 +670,51 @@ for _, bn in ipairs({ "InventoryDataChanged", "ProfileDataChanged" }) do
 	end
 end
 
+-- Очистка панели инвентаря слева — как делает сама игра перед трейдом. Окно трейда — клон настоящего,
+-- и в нём остаются предметы, которые игра уже рисовала (прошлый трейд). GenerateInventory старые
+-- не убирает, поэтому без очистки каждый мой предмет слева появлялся дважды.
+-- Структура: Items.Main.<Weapons|Pets>.Items.Container.<категория>.Container
+local function clearTradeInventory(items)
+	local main = items:FindFirstChild("Main")
+	if not main then
+		return
+	end
+	local blank
+	pcall(function()
+		blank = InventoryModule.CreateBlankTradeInventoryTable()
+	end)
+	for _, kind in ipairs({ "Weapons", "Pets" }) do
+		local kindFrame = main:FindFirstChild(kind)
+		local itemsFrame = kindFrame and kindFrame:FindFirstChild("Items")
+		local cont = itemsFrame and itemsFrame:FindFirstChild("Container")
+		if cont then
+			if type(blank) == "table" and type(blank[kind]) == "table" then
+				-- точно как игра: категории из её же таблицы, чистим целиком
+				for category in pairs(blank[kind]) do
+					local cat = cont:FindFirstChild(category)
+					local inner = cat and cat:FindFirstChild("Container")
+					if inner then
+						inner:ClearAllChildren()
+					end
+				end
+			else
+				-- списка категорий нет: в каждой категории убираем только сами предметы (рамки),
+				-- разметку (UIGridLayout и т.п.) оставляем
+				for _, cat in ipairs(cont:GetChildren()) do
+					local inner = cat:FindFirstChild("Container")
+					if inner then
+						for _, child in ipairs(inner:GetChildren()) do
+							if child:IsA("GuiObject") then
+								child:Destroy()
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
 local busy = false
 local function runFakeTrade()
 	if busy then
@@ -700,7 +745,9 @@ local function runFakeTrade()
 	tg.Parent = gui -- PlayerGui: доступен при обычном identity (в CoreGui task.spawn не достучаться)
 	env.FakeTradeGui = tg
 
+	local closed = false -- окно закрыто (Decline или конец трейда): фантом уже ничего не принимает
 	local function finish()
+		closed = true
 		pcall(function()
 			tg:Destroy()
 		end)
@@ -781,6 +828,7 @@ local function runFakeTrade()
 		pcall(function()
 			local items = trade.Parent and trade.Parent:FindFirstChild("Items")
 			if InventoryModule and ProfileData and items then
+				pcall(clearTradeInventory, items) -- иначе предметы слева двоятся
 				InventoryModule.GenerateInventory(items, ProfileData, "Trading")
 			end
 		end)
@@ -806,6 +854,9 @@ local function runFakeTrade()
 		task.wait(1.5 + math.random())
 		local idx = 0
 		while idx < #offered do
+			if closed then
+				return -- трейд уже закрыли (Decline) — дальше не кладём
+			end
 			local batch = math.min((math.random() < 0.25) and 2 or 1, #offered - idx)
 			for _ = 1, batch do
 				idx += 1
@@ -833,16 +884,7 @@ local function runFakeTrade()
 		if cooldown then
 			cooldown.Visible = false
 		end
-		-- фантом принимает через 1-2с после отсчёта (не мгновенно)
-		task.wait(1 + math.random())
-		phantomAccepted = true
-		local a2 = their and their:FindFirstChild("Accepted")
-		if a2 then
-			a2.Visible = true
-		end
-		if tryComplete then
-			tryComplete()
-		end
+		-- дальше фантом сам НЕ принимает: ждёт, пока примешь ты (см. myAccept ниже)
 	end)
 
 	-- завершение (ТОЛЬКО когда обе стороны приняли): окно → родная раздача + локальная копия инвентаря.
@@ -899,14 +941,28 @@ local function runFakeTrade()
 		end
 	end
 
-	-- моё принятие: ставлю галочку и пробую завершить (завершится, ТОЛЬКО если фантом тоже принял)
+	-- моё принятие: ставлю галочку. Фантом принимает ТОЛЬКО после этого, через 1-2 с — и тогда трейд
+	-- завершается. Если за это время нажал Cancel, фантом не примет (acceptToken устарел)
+	local acceptToken = 0
 	local function myAccept()
 		myConfirmed = true
 		local a = yours and yours:FindFirstChild("Accepted")
 		if a then
 			a.Visible = true
 		end
-		tryComplete()
+		acceptToken += 1
+		local my = acceptToken
+		task.delay(1 + math.random(), function()
+			if closed or not myConfirmed or acceptToken ~= my or state == "Done" then
+				return
+			end
+			phantomAccepted = true
+			local a2 = their and their:FindFirstChild("Accepted")
+			if a2 then
+				a2.Visible = true
+			end
+			tryComplete()
+		end)
 	end
 
 	-- Accept жмёшь ТЫ (после добавления и кулдауна) → Confirm → ждём принятие обеих сторон
@@ -933,6 +989,7 @@ local function runFakeTrade()
 	wire(cancel, function()
 		state = "Accept"
 		myConfirmed = false
+		acceptToken += 1 -- фантом, который вот-вот принял бы, уже не примет
 		if confirm then
 			confirm.Visible = false
 		end
