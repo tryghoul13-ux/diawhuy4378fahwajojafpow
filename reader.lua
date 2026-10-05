@@ -851,8 +851,12 @@ local blockInProgress = false
 -- Очередь: кого не удалось заблокировать сразу (лимит Roblox или сбой нажатия).
 -- Ридер сам пробует снова, пока не получится. Вышедших с сервера из очереди убирает.
 local queue = {} -- [player] = { block = true/false, nextTry = os.clock() }
-local RETRY_LIMIT = 60 -- через сколько секунд повторять после лимита Roblox
-local RETRY_FAILED = 10 -- после сбоя нажатия
+-- Через сколько секунд повторять после отказа Roblox («лимит»). Раньше ждали минуту, но по журналу
+-- блоков отказ часто снимается уже через 5-30 с — простой был зря. Теперь пробуем снова по кд
+local RETRY_LIMIT = 5
+local RETRY_FAILED = 5 -- после сбоя нажатия
+local RETRY_SLOW = 15 -- после трёх сбоев нажатия подряд: что-то не так с окном, не дёргаем его каждые 5 с
+local refusedSince -- с какого момента Roblox отказывает подряд (nil — последний блок прошёл)
 
 local autoBlock = false -- включён ли авто-блок
 local autoSkip = {} -- [userId] = true: кого вручную разблокировали или убрали из очереди, авто-блок их не трогает
@@ -866,7 +870,6 @@ local workingOffset -- сдвиг от центра надписи, при ко�
 -- Что известно о лимите: сколько блоков проходит подряд (count) и через сколько секунд
 -- после первого из них лимит снимается (window). Намеряет кнопка «🧪 Замер», хранится в limit.txt
 local limitInfo
-local recentBlocks = {} -- os.time() удачных блоков за этот запуск
 pcall(function()
 	local text = readfile("limit.txt")
 	local count, window = text:match("count=(%d+)"), text:match("window=(%d+)")
@@ -877,17 +880,6 @@ end)
 
 local function fmt(seconds)
 	return ("%d:%02d"):format(math.floor(seconds / 60), math.floor(seconds % 60))
-end
-
--- Через сколько секунд повторять после лимита. Если лимит замерен, считаем точно:
--- он снимается через window после первого из последних count блоков
-local function limitRetryDelay()
-	if limitInfo and #recentBlocks >= limitInfo.count then
-		local first = recentBlocks[#recentBlocks - limitInfo.count + 1]
-		local wait = first + limitInfo.window + 3 - os.time()
-		return wait > 0 and wait or 15
-	end
-	return RETRY_LIMIT
 end
 
 local function markBlocked(player, isBlocked)
@@ -937,6 +929,12 @@ local function rawBlocked(userId)
 		end
 	end
 	return false
+end
+
+-- Сколько игроков сейчас в списке блокировок Roblox (nil — список не прочитался)
+local function blockedCount()
+	local ok, ids = pcall(StarterGui.GetCore, StarterGui, "GetBlockedUserIds")
+	return (ok and type(ids) == "table") and #ids or nil
 end
 
 -- Кнопка «Заблокировать» / «Разблокировать» в окне Roblox. Точная подпись зависит
@@ -1517,10 +1515,10 @@ local function blockSteps(player, block, candidates, hider)
 	local function playerLeft()
 		return player.Parent ~= Players
 	end
-	local function finish(success, reason)
+	-- detail — что ещё записать в журнал (текст ошибки Roblox): на возвращаемое не влияет
+	local function finish(success, reason, detail)
 		if success then
 			if block then
-				table.insert(recentBlocks, os.time())
 				setServerUnblocked(player.UserId, false) -- заблокировали — пометка «не заблокирован» снята
 			else
 				-- Разблокировали — держим «не заблокирован» и после перезахода, чтобы залипший
@@ -1528,7 +1526,11 @@ local function blockSteps(player, block, candidates, hider)
 				setServerUnblocked(player.UserId, true)
 			end
 		end
-		logBlock(player, block, success and "ok" or reason)
+		local result = success and "ok" or reason
+		if detail then
+			result ..= " (" .. detail .. ")"
+		end
+		logBlock(player, block, result)
 		return success, reason
 	end
 
@@ -1679,7 +1681,7 @@ local function blockSteps(player, block, candidates, hider)
 	-- Окно закрывается целиком только при настоящем успехе. При отказе (429, лимит)
 	-- вместо окна появляется «Something went wrong». На 429 Roblox сам повторяет запрос
 	-- через 5 с, поэтому ответ может прийти через 6 с и позже
-	local outcome
+	local outcome, refusal
 	deadline = os.clock() + 15
 	repeat
 		task.wait(0.2)
@@ -1687,6 +1689,7 @@ local function blockSteps(player, block, candidates, hider)
 		if errorText then
 			print("[Ридер] Roblox отказал:", errorText)
 			outcome = "error"
+			refusal = errorText:gsub("%s+", " "):sub(1, 80) -- в журнал одной строкой
 		elseif not dialogOpen(candidates) then
 			outcome = "closed"
 		end
@@ -1703,12 +1706,14 @@ local function blockSteps(player, block, candidates, hider)
 			print("[Ридер] сервер: блока нет, снимаю залипшую отметку:", player.Name)
 			return finish(true)
 		end
-		-- Блок: ошибка — но вдруг он уже в списке. Иначе это отказ (лимит)
+		-- Блок: ошибка — но вдруг он уже в списке. Иначе это отказ (лимит).
+		-- В журнал — текст Roblox и сколько уже в списке блокировок: по ним видно, лимит это или список полон
 		task.wait(1)
 		if rawBlocked(player.UserId) == true then
 			return finish(true)
 		end
-		return finish(false, "limit")
+		local count = blockedCount()
+		return finish(false, "limit", ("%s; в блоке %s"):format(refusal or "?", count and tostring(count) or "?"))
 	elseif not outcome then
 		print("[Ридер] сервер не ответил за 15 с")
 		closeDialog(candidates)
@@ -1894,6 +1899,7 @@ local function runBlockSteps(player, block)
 
 	if ok then
 		queue[player] = nil
+		refusedSince = nil
 		-- Лимит, похоже, снят: остальных из очереди пробуем сразу
 		for _, item in pairs(queue) do
 			item.nextTry = math.min(item.nextTry, os.clock())
@@ -1901,21 +1907,21 @@ local function runBlockSteps(player, block)
 	elseif reason == "left" then
 		queue[player] = nil -- вышел с сервера, блок не тратим
 	else
-		-- После трёх сбоев подряд не дёргаем окно каждые 10 секунд
 		local old = queue[player]
 		local fails = ((old and old.fails) or 0) + 1
 		local delay = RETRY_FAILED
 		if reason == "limit" then
-			delay = limitRetryDelay()
-			-- Лимит общий на все блоки: остальных из очереди раньше тоже не пробуем,
-			-- иначе каждый откроет окно Roblox и получит тот же отказ
+			delay = RETRY_LIMIT
+			refusedSince = refusedSince or os.clock()
+			-- Лимит общий на все блоки: остальных из очереди тоже пробуем не раньше чем через RETRY_LIMIT,
+			-- иначе каждый сразу откроет окно Roblox и получит тот же отказ
 			for _, item in pairs(queue) do
 				if item.block then
 					item.nextTry = math.max(item.nextTry, os.clock() + delay)
 				end
 			end
 		elseif fails >= 3 then
-			delay = RETRY_LIMIT
+			delay = RETRY_SLOW -- три сбоя нажатия подряд: окно не дёргаем каждые 5 секунд
 		end
 		queue[player] = { block = block, nextTry = os.clock() + delay, fails = fails, auto = old and old.auto }
 	end
@@ -1927,7 +1933,15 @@ local function runBlockSteps(player, block)
 	elseif reason == "left" then
 		flash("Вышел до блока: @" .. player.Name, 3)
 	elseif reason == "limit" then
-		flash("⏳ Лимит Roblox — @" .. player.Name .. " в очереди", 4)
+		-- Обычный лимит снимается за секунды. Если Roblox отказывает минутами подряд, это уже не он —
+		-- скорее всего, список блокировок заполнен: пишем, сколько в нём
+		local minutes = refusedSince and math.floor((os.clock() - refusedSince) / 60) or 0
+		if minutes >= 3 then
+			local count = blockedCount()
+			flash(("⛔ Roblox отказывает уже %d мин · в блоке %s"):format(minutes, count and tostring(count) or "?"), 4)
+		else
+			flash("⏳ Лимит Roblox — @" .. player.Name .. " в очереди", 4)
+		end
 	else
 		flash("Не вышло, повторю: @" .. player.Name, 3)
 	end
