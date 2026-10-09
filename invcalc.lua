@@ -331,6 +331,19 @@ end)
 
 local SKIP = { DefaultKnife = true, DefaultGun = true } -- есть у всех, не продаются
 
+-- Считаем только годли и выше (как ридер): комонки, анкомонки, рарки и легендарки не берём.
+-- Хрома-годли тоже годли («Chroma Godly» содержит «godly»)
+local HIGH_RARITIES = { "godly", "ancient", "unique", "vintage" }
+local function isHigh(rarity)
+	local key = tostring(rarity or ""):lower()
+	for _, name in ipairs(HIGH_RARITIES) do
+		if key:find(name, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
 local function loadInventory(player)
 	if not invRemote then
 		return nil, "в этой игре нет инвентаря MM2"
@@ -388,18 +401,22 @@ local function buildLines(items)
 	local lines = {}
 	for _, it in ipairs(items) do
 		local info = infoFor(it.id, it.pet)
-		local line = { key = (it.pet and "p:" or "w:") .. it.id, id = it.id, owned = it.qty, pet = it.pet }
-		if info then
-			line.name, line.cat, line.rarity, line.chroma = info.name, info.cat, info.rarity, info.chroma
-			line.year, line.image = info.year, info.image
-			local best, maxPrice, variants, loose = priceFor(info.name, info.cat, info.chroma, info.rarity)
-			if best then
-				line.price, line.pid, line.priceMax, line.variants, line.loose = best.price, best.pid, maxPrice, variants, loose
+		-- Ниже годли не показываем и не считаем. Предмет, которого нет в базе игры (новый),
+		-- оставляем: его редкость неизвестна, а цены у него всё равно нет — в сумму он не идёт
+		if not info or isHigh(info.rarity) then
+			local line = { key = (it.pet and "p:" or "w:") .. it.id, id = it.id, owned = it.qty, pet = it.pet }
+			if info then
+				line.name, line.cat, line.rarity, line.chroma = info.name, info.cat, info.rarity, info.chroma
+				line.year, line.image = info.year, info.image
+				local best, maxPrice, variants, loose = priceFor(info.name, info.cat, info.chroma, info.rarity)
+				if best then
+					line.price, line.pid, line.priceMax, line.variants, line.loose = best.price, best.pid, maxPrice, variants, loose
+				end
+			else
+				line.name, line.cat, line.rarity, line.chroma, line.image = it.id, "", "", false, ""
 			end
-		else
-			line.name, line.cat, line.rarity, line.chroma, line.image = it.id, "", "", false, ""
+			table.insert(lines, makeLine(line))
 		end
-		table.insert(lines, makeLine(line))
 	end
 	table.sort(lines, function(a, b)
 		local av, bv = (a.price or -1) * a.owned, (b.price or -1) * b.owned
@@ -1028,7 +1045,7 @@ local function renderItems(keepScroll)
 	end
 	emptyLabel.TextColor3 = COL.muted
 	emptyLabel.Visible = #current.lines == 0
-	emptyLabel.Text = "У игрока нет предметов на продажу (кроме стандартных)"
+	emptyLabel.Text = "У игрока нет годли и выше"
 	searchBox.Visible = priceState.ok
 	-- у коллекционеров бывают сотни предметов: сначала рисуем самые дорогие, остальное по кнопке
 	local shown = math.min(#current.lines, current.showAll and math.huge or ROW_LIMIT)
